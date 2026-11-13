@@ -1,0 +1,37 @@
+name: aiy
+description: AIy - personal AI assistant and coding helper.
+publish_to: 'none'
+version: 1.4.0+1
+
+environment:
+  sdk: '>=3.13.0 <4.0.0'
+
+# Same proven package set as Dishy. Zip handling, the key vault (Android Keystore), the file picker and
+# opening links are done natively in MainActivity (written by the setup wizard), so no extra plugins are needed.
+dependencies:
+  flutter:
+    sdk: flutter
+  firebase_core: ^5.1.0
+  firebase_auth: ^7.0.1
+  # v7 changed the whole sign-in API (initialize once, authenticate(), exceptions): see lib/state/auth_service.dart.
+  google_sign_in: ^7.2.0
+  provider: ^6.1.2
+  shared_preferences: ^2.3.2
+  image_picker: ^1.1.2
+  speech_to_text: ^7.0.0
+  crypto: any
+  share_plus: ^13.3.1
+  path_provider: ^2.1.5
+  # App lock with the fingerprint (v3: named parameters instead of AuthenticationOptions) and the QR code for a release page (pure Dart).
+  local_auth: ^3.0.2
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/logo.png

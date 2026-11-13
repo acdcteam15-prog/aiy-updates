@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- aiy-icon: resources used only by name from Dart; stop the shrinker removing them -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_stat_aiy,@drawable/splash_logo,@drawable/ic_launcher_foreground,@drawable/ic_launcher_background,@drawable/ic_launcher_monochrome,@mipmap/ic_launcher" />

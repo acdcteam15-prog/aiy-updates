@@ -1,0 +1,13 @@
+I am continuing a project called AIy: an Android app for non-technical users (Flutter app + a Windows setup wizard, built the same way as my Dishy app). I attached two files: AIy-v1_4_0.zip (the whole project) and HANDOVER.md.
+
+1. Read HANDOVER.md completely first, then unzip the project.
+2. Reply in 5 short lines: the version, what is built, what has NOT been tested, and what you need from me next.
+3. Then wait for my request.
+
+Ground rules:
+- Give me complete project zips named AIy-v<major>_<minor>_<patch>.zip, and bump the version, CHANGES.md and README.
+- Before any big new feature: give suggestions first, then ask me pop-up questions (3 at a time, in rounds), then build.
+- I will paste build errors and tool output. Fix them in the project and give me a new zip.
+- Keep explanations short and plain, English only. Never say something was tested if it was not.
+
+What I will do first: build this version with START-HERE.bat / Rebuild-APK.bat on my PC, install it, and paste any error files and the "Test everything" report here.

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- aiy-icon: a ring with a small orbiting dot -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="7" android:pathData="M36,54 A18,18 0 1,0 72,54 A18,18 0 1,0 36,54 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M66,36 A6,6 0 1,0 78,36 A6,6 0 1,0 66,36 Z" />
+</vector>
