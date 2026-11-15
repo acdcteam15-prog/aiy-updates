@@ -12,6 +12,7 @@ import '../widgets/common.dart';
 import 'build_screen.dart';
 import 'connect_screen.dart';
 import 'publish_sheet.dart';
+import '../../state/app_log.dart';
 
 /// "Publish": push the current project to GitHub, then build the app there. Used under a finished change
 /// (Code tab) and under a freshly written app (Build tab).
@@ -42,18 +43,44 @@ class _PublishPanelState extends State<PublishPanel> {
 
   Future<void> _build(CodeState code, BuildState b) async {
     final prefs = context.read<LocalPrefs>();
+    // The Code list can rebuild this panel while GitHub is being checked (the panel's state is then replaced),
+    // which made "Build the app" stop silently. The navigator outlives it, so the rest uses the navigator.
+    final nav = Navigator.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    AppLog.i('build: checking ${b.repo} (${b.branch})');
     final prep = await b.prepare();
-    if (prep == null || !mounted) return;
+    if (prep == null) {
+      AppLog.i('build: not ready: ${b.error ?? 'no reason given'}');
+      if (b.error == null) messenger.showSnackBar(const SnackBar(content: Text('AIy could not get the build ready. Open Settings > Log and send it to the developer.')));
+      return;
+    }
+    AppLog.i('build: ready (${prep.kind.name}, workflow ${prep.workflow}${prep.addWorkflow ? ', will be added/updated' : ''})');
+    if (!nav.mounted) return;
+    if (prep.relaxed != null) {
+      // The project's own workflow has the Android SDK setup step that fails on GitHub: ask before changing it.
+      prep.fixSetup = await confirmDialog(
+        nav.context,
+        'Fix the build setup?',
+        body: 'This project builds with its own ${prep.workflow}. Its "setup-android" step fails on GitHub now (the old "tools" package was removed), '
+            'although GitHub\'s computers already have the Android tools. AIy can add one line ("continue-on-error: true") so that step can no longer stop the build. Nothing else changes.',
+        yes: 'Fix it',
+        no: 'Leave it',
+      );
+      if (!nav.mounted) return;
+    }
     final sel = await showModalBottomSheet<(String, String, bool)>(
-      context: context,
+      context: nav.context,
       isScrollControlled: true,
       useSafeArea: true,
       builder: (_) => VersionSheet(current: prep.version?.name, foundIn: prep.version?.path, notes: code.summary, release: prefs.publishRelease),
     );
-    if (sel == null || !mounted) return;
+    if (sel == null) {
+      AppLog.i('build: version question closed without a choice');
+      return;
+    }
     await prefs.setPublishRelease(sel.$3);
-    if (!mounted) return;
-    Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const BuildScreen()));
+    if (!nav.mounted) return;
+    unawaited(nav.push(MaterialPageRoute<void>(builder: (_) => const BuildScreen())));
     unawaited(b.start(prep, versionName: sel.$1, releaseNotes: sel.$2, release: sel.$3));
   }
 

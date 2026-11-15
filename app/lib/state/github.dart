@@ -2,7 +2,10 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+
 import 'net.dart';
+import 'app_log.dart';
 
 class GhRepo {
   final String full;
@@ -47,6 +50,10 @@ class GitHubApi {
       case 401:
         return 'GitHub rejected the sign-in (401). Connect GitHub again in Settings > Accounts & keys.';
       case 403:
+        // A rate limit is also a 403 at GitHub: the old text sent people to reconnect for nothing.
+        if (d.toLowerCase().contains('rate limit')) {
+          return 'GitHub\'s request limit for your account is used up for now (it resets within an hour). Wait a little and try again; nothing needs reconnecting.';
+        }
         return 'GitHub refused (403)${d.isEmpty ? '' : ': $d'}. The sign-in needs the "repo" and "workflow" permissions: disconnect GitHub and connect it again.';
       case 404:
         return 'GitHub says "not found" (404)${d.isEmpty ? '' : ': $d'}. If you were adding a workflow file, the sign-in lacks the "workflow" permission: disconnect GitHub and connect it again.';
@@ -59,12 +66,16 @@ class GitHubApi {
     }
   }
 
-  Future<dynamic> _call(String method, String path, {Object? json, bool allow404 = false}) async {
-    final r = await Net.send(method, Uri.parse('$_api$path'), headers: _h, json: json, timeoutSec: 90, who: 'GitHub');
+  Future<dynamic> _call(String method, String path, {Object? json, bool allow404 = false, int? retries}) async {
+    // Reading is repeated when a slow line times out; writing is only repeated where the call is safe to repeat (blobs).
+    final r = await Net.send(method, Uri.parse('$_api$path'), headers: _h, json: json, timeoutSec: 90, who: 'GitHub', retries: retries ?? (method == 'GET' || _repeatable(path) ? 2 : 0));
     if (allow404 && r.status == 404) return null;
     if (r.status < 200 || r.status >= 300) throw ApiError(_explain(r.status, r.body), r.status);
     return r.body.isEmpty ? null : jsonDecode(r.body);
   }
+
+  /// Writes that create content-addressed objects: sending them twice gives the same object, so they may be repeated.
+  static bool _repeatable(String path) => path.endsWith('/git/blobs') || path.endsWith('/git/trees') || path.endsWith('/git/commits');
 
   // ------------------------------------------------------------------ account and repositories
   Future<String> login() async => '${(await _call('GET', '/user') as Map)['login']}';
@@ -106,8 +117,18 @@ class GitHubApi {
   }
 
   /// Downloads the branch as a zip (the same file as GitHub's "Download ZIP").
-  Future<void> downloadZip(String full, String branch, File out, {void Function(int got)? onProgress}) =>
-      Net.download(Uri.parse('$_api/repos/$full/zipball/${Uri.encodeComponent(branch)}'), out, headers: _h, onProgress: onProgress);
+  /// The branch is first turned into its exact commit, so a download that is continued later can never mix
+  /// two versions of the branch (GitHub sends no ETag for zipballs). Falls back to the branch name if that lookup fails.
+  Future<void> downloadZip(String full, String branch, File out, {void Function(int got)? onProgress}) async {
+    var ref = branch;
+    try {
+      final sha = await branchSha(full, branch);
+      if (RegExp(r'^[0-9a-f]{40}$').hasMatch(sha)) ref = sha;
+    } catch (e) {
+      AppLog.i('zipball: commit of $branch not found ($e), using the branch name');
+    }
+    await Net.download(Uri.parse('$_api/repos/$full/zipball/${Uri.encodeComponent(ref)}'), out, headers: _h, onProgress: onProgress);
+  }
 
   /// The text of a file in the repository, or null when it is not there.
   Future<String?> fileText(String repo, String path, String ref) async {
@@ -121,18 +142,35 @@ class GitHubApi {
 
   Future<String> commitTree(String repo, String commitSha) async => '${((await _call('GET', '/repos/$repo/git/commits/$commitSha') as Map)['tree'] as Map)['sha']}';
 
-  Future<String> createBlob(String repo, List<int> bytes) async =>
-      '${(await _call('POST', '/repos/$repo/git/blobs', json: {'content': base64Encode(bytes), 'encoding': 'base64'}) as Map)['sha']}';
+  /// Files already uploaded to a repository in this session (by their git blob id). A push that was interrupted by a
+  /// slow or broken line does not send them again when it is repeated.
+  static final Map<String, Set<String>> _sent = {};
+
+  Future<String> createBlob(String repo, List<int> bytes) async {
+    // Git names a file by the hash of "blob <length>\0<content>": the same name GitHub will answer with.
+    final sha = sha1.convert([...utf8.encode('blob ${bytes.length}\u0000'), ...bytes]).toString();
+    if (_sent[repo]?.contains(sha) == true) return sha;
+    final r = await _call('POST', '/repos/$repo/git/blobs', json: {'content': base64Encode(bytes), 'encoding': 'base64'}, retries: 2) as Map;
+    final got = '${r['sha']}';
+    (_sent[repo] ??= {}).add(got);
+    return got;
+  }
 
   /// Entries are (path, mode, blob sha). Files that are not listed stay as they are.
   Future<String> createTree(String repo, String baseTree, List<(String, String, String)> entries) async {
-    final r = await _call('POST', '/repos/$repo/git/trees', json: {
-      'base_tree': baseTree,
-      'tree': [
-        for (final (path, mode, sha) in entries) {'path': path, 'mode': mode, 'type': 'blob', 'sha': sha}
-      ],
-    });
-    return '${(r as Map)['sha']}';
+    try {
+      final r = await _call('POST', '/repos/$repo/git/trees', json: {
+        'base_tree': baseTree,
+        'tree': [
+          for (final (path, mode, sha) in entries) {'path': path, 'mode': mode, 'type': 'blob', 'sha': sha}
+        ],
+      });
+      return '${(r as Map)['sha']}';
+    } on ApiError {
+      // If GitHub does not know a file we thought was uploaded (the repository was replaced), send everything again.
+      _sent.remove(repo);
+      rethrow;
+    }
   }
 
   Future<String> createCommit(String repo, String message, String tree, String parent) async =>
@@ -152,9 +190,26 @@ class GitHubApi {
   RunInfo _run(Map o) => RunInfo((o['id'] as num).toInt(), (o['run_number'] as num?)?.toInt() ?? 0, '${o['status'] ?? ''}', '${o['conclusion'] ?? ''}', '${o['html_url'] ?? ''}', '${o['head_sha'] ?? ''}');
 
   /// The newest runs of a workflow that were started by hand on a branch.
-  Future<List<RunInfo>> runs(String repo, String workflow, String branch) async {
-    final o = await _call('GET', '/repos/$repo/actions/workflows/$workflow/runs?event=workflow_dispatch&branch=${Uri.encodeComponent(branch)}&per_page=8') as Map;
+  Future<List<RunInfo>> runs(String repo, String workflow, String branch, {String event = 'workflow_dispatch'}) async {
+    final o = await _call('GET', '/repos/$repo/actions/workflows/$workflow/runs?${event.isEmpty ? '' : 'event=$event&'}branch=${Uri.encodeComponent(branch)}&per_page=8') as Map;
     return [for (final r in (o['workflow_runs'] as List? ?? const [])) if (r is Map) _run(r)];
+  }
+
+  /// The runs of a workflow for one exact commit (newest first).
+  Future<List<RunInfo>> runsForCommit(String repo, String workflow, String sha) async {
+    final o = await _call('GET', '/repos/$repo/actions/workflows/$workflow/runs?head_sha=$sha&per_page=5', allow404: true);
+    if (o is! Map) return const [];
+    return [for (final r in (o['workflow_runs'] as List? ?? const [])) if (r is Map) _run(r)];
+  }
+
+  /// Whether GitHub Actions is switched on for the repository (null when GitHub does not say).
+  Future<bool?> actionsEnabled(String repo) async {
+    try {
+      final o = await _call('GET', '/repos/$repo/actions/permissions', allow404: true);
+      return o is Map ? o['enabled'] as bool? : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<RunInfo> run(String repo, int id) async => _run(await _call('GET', '/repos/$repo/actions/runs/$id') as Map);
@@ -174,7 +229,10 @@ class GitHubApi {
         final name = '${s['name']}';
         if (name.startsWith('Set up job') || name.startsWith('Post ') || name.startsWith('Complete job')) continue;
         final st = '${s['status']}', concl = '${s['conclusion']}';
-        final state = st == 'completed' ? ((concl == 'success' || concl == 'skipped') ? 'done' : 'failed') : (st == 'in_progress' ? 'running' : 'waiting');
+        // A step after a failure is "skipped": it never ran, so it is not done (the old code showed a tick).
+        final state = st == 'completed'
+            ? (concl == 'success' ? 'done' : (concl == 'skipped' ? 'skipped' : (concl == 'cancelled' ? 'skipped' : 'failed')))
+            : (st == 'in_progress' ? 'running' : 'waiting');
         if (state == 'running') current = name;
         out.add(StepInfo('${j['name']}', name, state));
       }
@@ -200,7 +258,9 @@ class GitHubApi {
   Future<void> cancelRun(String repo, int id) async {
     try {
       await _call('POST', '/repos/$repo/actions/runs/$id/cancel');
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('github:223: $e');
+    }
   }
 
   /// The downloads of a finished run: (id, name).
@@ -224,9 +284,21 @@ class GitHubApi {
   }
 
   Future<void> uploadAsset(String repo, int releaseId, File file, String name) async {
-    final r = await Net.upload(Uri.parse('https://uploads.github.com/repos/$repo/releases/$releaseId/assets?name=${Uri.encodeQueryComponent(name)}'), file,
-        headers: _h, contentType: 'application/vnd.android.package-archive', who: 'GitHub');
-    if (r.status < 200 || r.status >= 300) throw ApiError(_explain(r.status, r.body), r.status);
+    // The whole file is sent again when the line fails (a release file cannot be sent in pieces). If the first try had
+    // really arrived and only the answer was lost, GitHub says "already exists": that counts as done.
+    for (var attempt = 0;; attempt++) {
+      try {
+        final r = await Net.upload(Uri.parse('https://uploads.github.com/repos/$repo/releases/$releaseId/assets?name=${Uri.encodeQueryComponent(name)}'), file,
+            headers: _h, contentType: 'application/vnd.android.package-archive', who: 'GitHub');
+        if (r.status == 422 && r.body.contains('already_exists')) return;
+        if (r.status < 200 || r.status >= 300) throw ApiError(_explain(r.status, r.body), r.status);
+        return;
+      } on ApiError catch (e) {
+        final again = e.status == -1 && !e.message.startsWith('No internet');
+        if (!again || attempt >= 2) rethrow;
+        await Future<void>.delayed(Duration(seconds: 3 << attempt));
+      }
+    }
   }
 }
 

@@ -4,6 +4,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../state/app_log.dart';
 import '../widgets/common.dart';
+import '../../state/report.dart';
 
 /// The last lines AIy logged (keys removed): copy or share them when something goes wrong.
 class LogScreen extends StatefulWidget {
@@ -26,6 +27,15 @@ class _LogScreenState extends State<LogScreen> {
             onPressed: () {
               Clipboard.setData(ClipboardData(text: text));
               snack(context, 'Log copied');
+            },
+          ),
+          IconButton(
+            tooltip: 'Copy a full report (app, phone, connection, log; keys removed)',
+            icon: const Icon(Icons.assignment_outlined),
+            onPressed: () async {
+              final r = await ReportBundle.build();
+              await Clipboard.setData(ClipboardData(text: r));
+              if (context.mounted) snack(context, 'Report copied (keys removed)');
             },
           ),
           IconButton(tooltip: 'Share', icon: const Icon(Icons.ios_share_rounded), onPressed: () => SharePlus.instance.share(ShareParams(text: text, subject: 'AIy log'))),

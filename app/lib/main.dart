@@ -11,18 +11,25 @@ import 'state/app_builder.dart';
 import 'state/app_log.dart';
 import 'state/build_state.dart';
 import 'state/chat_store.dart';
+import 'state/background_work.dart';
 import 'state/code_state.dart';
+import 'state/connectivity.dart';
+import 'state/native.dart';
 import 'state/error_center.dart';
 import 'state/keys.dart';
 import 'state/lock.dart';
 import 'state/prefs.dart';
 import 'state/share_inbox.dart';
+import 'state/slow_line.dart';
 import 'state/spend.dart';
 import 'state/updater.dart';
 import 'ui/screens/auth_gate.dart';
 import 'ui/screens/lock_screen.dart';
 import 'ui/theme.dart';
 import 'ui/widgets/error_popup.dart';
+import 'state/net.dart';
+import 'state/paid_jobs.dart';
+import 'state/storage.dart';
 
 Future<void> main() async {
   // Any startup problem shows a readable error screen instead of closing the app.
@@ -51,22 +58,58 @@ Future<void> main() async {
     final engine = AiEngine(keys, prefs);
     final spend = SpendLog();
     await spend.load();
+    await PaidJobs.instance.load();
+    unawaited(StorageInfo.startupCheck());
     final code = CodeState(engine, keys, prefs, spend);
     final builder = AppBuilder(engine, keys, prefs, code, spend);
     final inbox = ShareInbox();
+    final slow = SlowLine()..attach();
+    final net = ConnectivityService(onLost: spend.add, notifier: Native.notify);
+    Offline.service = net;
+    Net.onRetryWait = (who, status, sec) => AppLog.i('$who answered $status: waiting ${sec}s and trying again');
+    final chat = ChatStore(engine, prefs);
+    final build = BuildState(code, keys, prefs);
+    // While AIy works or waits for the internet, the "AIy is working" notification keeps the app running in the background.
+    final work = BackgroundWork(
+      summary: () => workSummary(
+        chatBusy: chat.busy,
+        chatText: chat.streamText,
+        codeBusy: code.busy,
+        asking: code.asking,
+        builderBusy: builder.busy,
+        buildRunning: build.running,
+        buildStatus: build.status,
+        waitingForInternet: net.jobs.length,
+        resending: net.resending,
+      ),
+      show: Native.workShow,
+      hide: Native.workHide,
+    );
+    for (final n in <ChangeNotifier>[chat, code, builder, build, net]) {
+      n.addListener(work.changed);
+    }
+    // "Stop" in the notification: ends the answers that are arriving and forgets the waiting requests.
+    Native.listenWorkStop(() {
+      engine.stopAll();
+      chat.stop();
+      net.cancelAll();
+    });
     ErrorCenter.presenter = showAiProblem;
     runApp(MultiProvider(
       providers: [
         ChangeNotifierProvider<LocalPrefs>.value(value: prefs),
         ChangeNotifierProvider<KeyVault>.value(value: keys),
         Provider<AiEngine>.value(value: engine),
-        ChangeNotifierProvider<ChatStore>(create: (_) => ChatStore(engine, prefs)),
+        ChangeNotifierProvider<ChatStore>.value(value: chat),
         ChangeNotifierProvider<CodeState>.value(value: code),
         ChangeNotifierProvider<AppBuilder>.value(value: builder),
         ChangeNotifierProvider<ShareInbox>.value(value: inbox),
+        ChangeNotifierProvider<ConnectivityService>.value(value: net),
+        ChangeNotifierProvider<SlowLine>.value(value: slow),
         ChangeNotifierProvider<SpendLog>.value(value: spend),
+        ChangeNotifierProvider<PaidJobs>.value(value: PaidJobs.instance),
         ChangeNotifierProvider<LockService>(create: (_) => LockService(prefs)),
-        ChangeNotifierProvider<BuildState>(lazy: false, create: (_) => BuildState(code, keys, prefs)),
+        ChangeNotifierProvider<BuildState>.value(value: build),
         ChangeNotifierProvider<UpdateService>(lazy: false, create: (_) => UpdateService(prefs)),
       ],
       child: const AiyApp(),
@@ -74,7 +117,7 @@ Future<void> main() async {
     // Something shared into AIy from another app (also when AIy was closed): ask the phone once at the start.
     inbox.start();
     // Model names change often: fetch each service's current list in the background (once a day).
-    for (final p in const ['gemini', 'groq', 'openrouter']) {
+    for (final p in AiEngine.chatProviders) {
       unawaited(engine.refreshModels(p));
     }
   }, (error, stack) {
@@ -133,7 +176,13 @@ class _AiyAppState extends State<AiyApp> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState s) {
     final lock = Provider.of<LockService>(context, listen: false);
     if (s == AppLifecycleState.paused) lock.paused();
-    if (s == AppLifecycleState.resumed) lock.resumed();
+    if (s == AppLifecycleState.resumed) {
+      lock.resumed();
+      // Back on the screen: look for the internet at once instead of waiting for the next check.
+      Provider.of<ConnectivityService>(context, listen: false).nudge();
+      // A waiting or interrupted update download continues; a new version is looked for.
+      Provider.of<UpdateService>(context, listen: false).onResume();
+    }
   }
 
   @override

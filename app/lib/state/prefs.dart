@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -25,6 +27,33 @@ class LocalPrefs extends ChangeNotifier {
   Future<void> setReduceMotion(bool v) => _set(_sp.setBool('reduceMotion', v));
   Future<void> setFontScale(double v) => _set(_sp.setDouble('fontScale', v));
 
+  // ---- model picker: starred models and the last ones chosen
+  List<String> get favModels => _sp.getStringList('favModels') ?? const [];
+  List<String> get recentModels => _sp.getStringList('recentModels') ?? const [];
+  Future<void> toggleFavModel(String id) {
+    final l = [...favModels];
+    l.contains(id) ? l.remove(id) : l.insert(0, id);
+    return _set(_sp.setStringList('favModels', l));
+  }
+
+  Future<void> addRecentModel(String id) => _set(_sp.setStringList('recentModels', [id, ...recentModels.where((x) => x != id)].take(5).toList()));
+
+  // ---- unsent text per chat (kept across restarts)
+  Map<String, String> get drafts {
+    try {
+      final j = jsonDecode(_sp.getString('drafts') ?? '{}');
+      return j is Map ? {for (final e in j.entries) '${e.key}': '${e.value}'} : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Saved without notifying (typing must not repaint every screen); at most 30 chats keep a draft.
+  Future<void> saveDrafts(Map<String, String> d) {
+    final keep = Map.fromEntries(d.entries.where((e) => e.value.trim().isNotEmpty).toList().reversed.take(30).toList().reversed);
+    return _sp.setString('drafts', jsonEncode(keep));
+  }
+
   // ---- first-run setup
   bool get onboarded => _sp.getBool('onboarded') ?? false;
   Future<void> setOnboarded(bool v) => _set(_sp.setBool('onboarded', v));
@@ -37,6 +66,10 @@ class LocalPrefs extends ChangeNotifier {
   bool get advanced => _sp.getBool('advanced') ?? false;
   Future<void> setAdvanced(bool v) => _set(_sp.setBool('advanced', v));
 
+  /// Lite mode for a slow connection: less data is sent (smaller photos, shorter history, no live search, shorter answers).
+  bool get liteMode => _sp.getBool('liteMode') ?? false;
+  Future<void> setLiteMode(bool v) => _set(_sp.setBool('liteMode', v));
+
   // ---- chat
   bool get liveSearch => _sp.getBool('liveSearch') ?? false;
   Future<void> setLiveSearch(bool v) => _set(_sp.setBool('liveSearch', v));
@@ -47,7 +80,17 @@ class LocalPrefs extends ChangeNotifier {
   double get capUsd => _sp.getDouble('capUsd') ?? 0.25;
   Future<void> setCapUsd(double v) => _set(_sp.setDouble('capUsd', v));
 
+  /// Most money for paid requests per day / per month (0 = no limit).
+  double get dayCapUsd => _sp.getDouble('dayCapUsd') ?? 0;
+  Future<void> setDayCapUsd(double v) => _set(_sp.setDouble('dayCapUsd', v));
+  double get monthCapUsd => _sp.getDouble('monthCapUsd') ?? 0;
+  Future<void> setMonthCapUsd(double v) => _set(_sp.setDouble('monthCapUsd', v));
+
   // ---- chat extras
+  /// Short follow-up questions under each answer.
+  bool get followUps => _sp.getBool('followUps') ?? true;
+  Future<void> setFollowUps(bool v) => _set(_sp.setBool('followUps', v));
+
   String get customInstructions => _sp.getString('customInstructions') ?? '';
   Future<void> setCustomInstructions(String v) => _set(_sp.setString('customInstructions', v));
   String get preferProvider => _sp.getString('preferProvider') ?? '';
@@ -58,6 +101,13 @@ class LocalPrefs extends ChangeNotifier {
   Future<void> setChatOrModel(String v) => _set(_sp.setString('chatOrModel', v));
 
   /// Chat folders the person made (a folder can be empty, so the names are kept here; each chat remembers its folder).
+  /// Models that answered "this model cannot be used here" (batch-only, agent-only...). Hidden from every list.
+  List<String> get unusableModels => _sp.getStringList('unusableModels') ?? const [];
+  Future<void> addUnusableModel(String id) async {
+    if (id.isEmpty || unusableModels.contains(id)) return;
+    await _set(_sp.setStringList('unusableModels', [...unusableModels, id]));
+  }
+
   List<String> get folders => _sp.getStringList('folders') ?? const [];
   Future<void> setFolders(List<String> v) => _set(_sp.setStringList('folders', v));
 
@@ -80,7 +130,7 @@ class LocalPrefs extends ChangeNotifier {
 
   // ---- backup: the settings that are worth carrying to another phone (never keys or the PIN)
   Map<String, dynamic> exportSettings() => {
-        'themeMode': themeMode.index, 'preset': preset, 'amoled': amoled, 'reduceMotion': reduceMotion, 'fontScale': fontScale, 'capUsd': capUsd,
+        'themeMode': themeMode.index, 'preset': preset, 'amoled': amoled, 'reduceMotion': reduceMotion, 'fontScale': fontScale, 'capUsd': capUsd, 'dayCapUsd': dayCapUsd, 'monthCapUsd': monthCapUsd,
         'liveSearch': liveSearch, 'customInstructions': customInstructions, 'publishRelease': publishRelease, 'preferProvider': preferProvider, 'advanced': advanced, 'folders': folders,
       };
 
@@ -142,6 +192,22 @@ class LocalPrefs extends ChangeNotifier {
   }
 
   // ---- app updates
+  /// Download a found update by itself in the background, on Wi-Fi only.
+  bool get autoDownloadUpdate => _sp.getBool('autoDownloadUpdate') ?? true;
+  Future<void> setAutoDownloadUpdate(bool v) => _set(_sp.setBool('autoDownloadUpdate', v));
+
+  /// The update being downloaded or waiting to be installed (UpdateInfo as JSON), so it survives closing the app.
+  String get updatePending => _sp.getString('updatePending') ?? '';
+  Future<void> setUpdatePending(String v) => _sp.setString('updatePending', v);
+  bool get updateUserPaused => _sp.getBool('updateUserPaused') ?? false;
+  Future<void> setUpdateUserPaused(bool v) => _sp.setBool('updateUserPaused', v);
+
+  /// "Skip this version" (the version key) and "Remind me later" (when to show it again, ms since epoch).
+  String get skippedUpdate => _sp.getString('skippedUpdate') ?? '';
+  Future<void> setSkippedUpdate(String v) => _sp.setString('skippedUpdate', v);
+  int get remindUpdateAt => _sp.getInt('remindUpdateAt') ?? 0;
+  Future<void> setRemindUpdateAt(int v) => _sp.setInt('remindUpdateAt', v);
+
   bool get autoUpdateCheck => _sp.getBool('autoUpdateCheck') ?? true;
   int get updateLastCheck => _sp.getInt('updateLastCheck') ?? 0;
   String get whatsNewSeen => _sp.getString('whatsNewSeen') ?? '';

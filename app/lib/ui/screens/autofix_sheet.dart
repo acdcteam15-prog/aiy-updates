@@ -8,6 +8,7 @@ import '../../state/prefs.dart';
 import '../widgets/common.dart';
 import '../widgets/fx.dart';
 import 'model_picker.dart';
+import '../../state/app_log.dart';
 
 /// "Fix and rebuild automatically": the model, how many rounds, and what it can cost.
 class AutoFixSheet extends StatefulWidget {
@@ -29,14 +30,40 @@ class _AutoFixSheetState extends State<AutoFixSheet> {
     _restore();
   }
 
+  String _hint = '';
+  OrModel? _free;
+  bool _freeFirst = true;
+
+  /// The free model to try first: a known coding family with the biggest context, else any free one with 32k+.
+  static OrModel? pickFree(List<OrModel> all) {
+    final free = all.where((m) => m.free && m.context >= 32000).toList()
+      ..sort((a, b) {
+        if (a.coding != b.coding) return a.coding ? -1 : 1;
+        return b.context.compareTo(a.context);
+      });
+    return free.isEmpty ? null : free.first;
+  }
+
   Future<void> _restore() async {
-    final id = context.read<LocalPrefs>().codeModel;
-    if (id.isEmpty) return;
+    final b = context.read<BuildState>();
+    final engine = context.read<AiEngine>();
+    final prefsId = context.read<LocalPrefs>().codeModel;
+    final fixer = await b.modelThatFixed(b.problems);
+    final id = fixer ?? prefsId;
     try {
-      final all = await context.read<AiEngine>().orModels();
-      final m = all.where((m) => m.id == id).toList();
-      if (mounted && m.isNotEmpty) setState(() => _model = m.first);
-    } catch (_) {}
+      final all = await engine.orModels();
+      final f = pickFree(all);
+      if (mounted) setState(() => _free = f);
+      final m = id.isEmpty ? <OrModel>[] : all.where((m) => m.id == id).toList();
+      if (mounted && m.isNotEmpty) {
+        setState(() {
+          _model = m.first;
+          if (fixer != null) _hint = '${m.first.name} fixed this kind of error last time, so it is picked.';
+        });
+      }
+    } catch (e) {
+      AppLog.i('autofix_sheet:39: $e');
+    }
   }
 
   Future<void> _choose() async {
@@ -45,6 +72,8 @@ class _AutoFixSheetState extends State<AutoFixSheet> {
     setState(() => _model = m);
     context.read<LocalPrefs>().setCodeModel(m.id);
   }
+
+  bool get _useFree => _freeFirst && _free != null && _model != null && !_model!.free;
 
   @override
   Widget build(BuildContext context) {
@@ -72,6 +101,17 @@ class _AutoFixSheetState extends State<AutoFixSheet> {
             ]),
           ),
         ),
+        if (_hint.isNotEmpty) ...[const SizedBox(height: 6), Text(_hint, style: sub)],
+        if (_free != null && _model != null && !_model!.free) ...[
+          const SizedBox(height: 6),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _freeFirst,
+            onChanged: (v) => setState(() => _freeFirst = v),
+            title: Text('Try a free model first', style: t.textTheme.titleSmall),
+            subtitle: Text('${_free!.name} gets one free try. Only if its fix does not work does ${_model!.name} take over (and cost money).', style: sub),
+          ),
+        ],
         const SizedBox(height: 12),
         Text('How many tries at most?', style: t.textTheme.titleSmall),
         const SizedBox(height: 6),
@@ -79,7 +119,7 @@ class _AutoFixSheetState extends State<AutoFixSheet> {
         if (est != null) ...[
           const SizedBox(height: 10),
           Text(
-            est.blocked ?? (_model!.free ? 'Free model: no cost.' : 'Each try: about ${fmtMoney(est.cost)}, never more than your limit of \$${cap.toStringAsFixed(2)}. With $_rounds ${_rounds == 1 ? 'try' : 'tries'}: at most about ${fmtMoney(est.worstCase * _rounds)}.'),
+            est.blocked ?? (_model!.free ? 'Free model: no cost.' : '${_useFree ? 'First try free (${_free!.name}). Then each' : 'Each'} try: about ${fmtMoney(est.cost)}, never more than your limit of \$${cap.toStringAsFixed(2)}. With $_rounds ${_rounds == 1 ? 'try' : 'tries'}: at most about ${fmtMoney(est.worstCase * _rounds)}.'),
             style: sub?.copyWith(color: est.blocked != null ? t.colorScheme.error : null),
           ),
         ],
@@ -87,7 +127,7 @@ class _AutoFixSheetState extends State<AutoFixSheet> {
         Row(children: [
           Expanded(child: OutlinedButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel'))),
           const SizedBox(width: 12),
-          Expanded(child: FilledButton(onPressed: _model == null || _problem != null || (est?.blocked != null) ? null : () => Navigator.pop(context, (_model!, _rounds)), child: const Text('Start'))),
+          Expanded(child: FilledButton(onPressed: _model == null || _problem != null || (est?.blocked != null) ? null : () => Navigator.pop(context, (_model!, _rounds, _useFree ? _free : null)), child: const Text('Start'))),
         ]),
       ]),
     );

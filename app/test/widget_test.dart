@@ -3,11 +3,15 @@ import 'package:aiy/logic/brief.dart';
 import 'package:aiy/logic/buildlog.dart';
 import 'package:aiy/logic/pin.dart';
 import 'package:aiy/logic/redact.dart';
+import 'package:aiy/logic/lite.dart';
 import 'package:aiy/logic/patcher.dart';
 import 'package:aiy/logic/project.dart';
 import 'package:aiy/logic/versioning.dart';
 import 'package:aiy/logic/workflows.dart';
+import 'package:aiy/state/background_work.dart';
+import 'package:aiy/state/connectivity.dart';
 import 'package:aiy/state/net.dart';
+import 'package:aiy/state/slow_line.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -139,5 +143,234 @@ void main() {
     final none = await Net.sse(Uri.parse('$base/ok'), json: {'q': 'hello'}, who: 'Test', cancel: cancel).toList();
     expect(none.length, 0);
     await server.close(force: true);
+  });
+
+  test('only connection problems wait for the internet', () {
+    expect(ApiError('x', -1).isConnection, true);
+    expect(ApiError('x', 429).isConnection, false);
+    expect(ApiError('x', -1, '', '', '', [ApiError('a', -1), ApiError('b', 429)]).isConnection, false);
+    expect(ApiError('x', -1, '', '', '', [ApiError('a', -1), ApiError('b', -1)]).isConnection, true);
+  });
+
+  test('waiting requests are sent again when the internet is back, and not for ever', () async {
+    var online = false;
+    final sent = <String>[];
+    final notes = <String>[];
+    final lost = <double>[];
+    final c = ConnectivityService(
+      probe: () async => online,
+      notifier: (t, x) async => notes.add(t),
+      onLost: (k, p, m, cost) async => lost.add(cost),
+      poll: const Duration(milliseconds: 20),
+    );
+    final err = ApiError('No internet connection (x).', -1, 'OpenRouter', 'm');
+    err.lostCost = () async => 0.05;
+    expect(c.hold(err, title: 'A', run: () async => sent.add('A')), true);
+    expect(c.hold(ApiError('bad', 429), title: 'B', run: () async {}), false);
+    expect(c.offline, true);
+    expect(c.jobs.length, 1);
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    expect(sent.length, 0);
+    online = true;
+    await Future<void>.delayed(const Duration(milliseconds: 700));
+    expect(sent, ['A']);
+    expect(c.offline, false);
+    expect(notes.length, 1);
+    expect(lost, [0.05]);
+    // a request that keeps failing for lack of internet is sent again 3 times, then given up
+    var runs = 0;
+    late Future<void> Function() again;
+    again = () async {
+      runs++;
+      c.hold(ApiError('No internet connection (x).', -1), title: 'C', run: again);
+    };
+    online = false;
+    expect(c.hold(ApiError('No internet connection (x).', -1), title: 'C', run: again), true);
+    online = true;
+    await Future<void>.delayed(const Duration(milliseconds: 3500));
+    expect(runs, 3);
+    expect(c.jobs.length, 0);
+    expect(c.offline, false);
+    // a waiting request can be cancelled
+    online = false;
+    c.hold(ApiError('No internet connection (x).', -1), title: 'D', run: () async => sent.add('D'));
+    c.cancel(c.jobs.first);
+    expect(c.jobs.length, 0);
+    expect(c.offline, false);
+    online = true;
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(sent, ['A']);
+    c.dispose();
+  });
+
+  test('the working notification says what is going on', () {
+    ({String title, String text})? sum({bool chat = false, String chatText = '', String code = '', String builder = '', bool build = false, int waiting = 0}) => workSummary(
+          chatBusy: chat,
+          chatText: chatText,
+          codeBusy: code,
+          asking: false,
+          builderBusy: builder,
+          buildRunning: build,
+          buildStatus: '',
+          waitingForInternet: waiting,
+          resending: false,
+        );
+    expect(sum() == null, true);
+    expect(sum(chat: true)!.text, 'Thinking about an answer…');
+    expect(sum(chat: true, chatText: 'abc')!.text, 'Writing an answer (3 letters so far)…');
+    expect(sum(code: 'Writing lib/main.dart…')!.title, 'AIy is working');
+    final two = sum(code: 'Writing the patch…', waiting: 2)!;
+    expect(two.title, 'AIy is working (2 jobs)');
+    expect(two.text, 'Writing the patch…');
+    expect(sum(waiting: 1)!.text, 'Waiting for the internet (1 request)');
+  });
+
+  test('the notification is shown while work runs, updated slowly, and removed after a pause', () async {
+    var text = '';
+    final shown = <String>[];
+    var hidden = 0;
+    final w = BackgroundWork(
+      summary: () => text.isEmpty ? null : (title: 'AIy is working', text: text),
+      show: (t, x) async => shown.add(x),
+      hide: () async => hidden++,
+      minGap: const Duration(milliseconds: 100),
+      linger: const Duration(milliseconds: 150),
+    );
+    w.changed();
+    expect(shown.length, 0);
+    text = 'one';
+    w.changed();
+    text = 'two';
+    w.changed();
+    text = 'three';
+    w.changed();
+    expect(shown, ['one']);
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    expect(shown, ['one', 'three']);
+    text = '';
+    w.changed();
+    expect(hidden, 0);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(hidden, 1);
+    expect(w.isOn, false);
+    w.dispose();
+  });
+
+  test('waiting requests saved before a restart come back quietly and can be cancelled', () async {
+    var online = false;
+    final sent = <String>[];
+    final notes = <String>[];
+    var cancelled = 0;
+    final c = ConnectivityService(probe: () async => online, notifier: (t, x) async => notes.add(t), poll: const Duration(milliseconds: 20));
+    c.restore(title: 'Chat: one', run: () async => sent.add('one'), onCancel: () => cancelled++);
+    c.restore(title: 'Chat: one', run: () async => sent.add('dup'));
+    c.restore(title: 'App: two', run: () async => sent.add('two'), onCancel: () => cancelled++);
+    expect(c.jobs.length, 2);
+    c.cancel(c.jobs.last);
+    expect(cancelled, 1);
+    c.cancelAll();
+    expect(cancelled, 2);
+    expect(c.jobs.length, 0);
+    c.restore(title: 'Chat: three', run: () async => sent.add('three'));
+    online = true;
+    await Future<void>.delayed(const Duration(milliseconds: 700));
+    expect(sent, ['three']);
+    expect(notes.length, 0);
+    c.dispose();
+  });
+
+  test('Lite mode keeps the latest messages and cuts long texts', () {
+    expect(shorten('short'), 'short');
+    final long = 'a' * 5000;
+    final cut = shorten(long);
+    expect(cut.length < 2200, true);
+    expect(cut.contains('shortened'), true);
+    expect(liteIndexes([true, false, true]), [0, 1, 2]);
+    final many = [for (var i = 0; i < 20; i++) i.isEven];
+    final keep = liteIndexes(many);
+    expect(keep.last, 19);
+    expect(many[keep.first], true);
+    expect(keep.length <= liteKeepMessages, true);
+  });
+
+  test('a slow line is noticed after timeouts, offered Lite mode, and forgotten when answers are quick', () {
+    final sl = SlowLine();
+    expect(sl.slow, false);
+    sl.onTimeout();
+    expect(sl.slow, false);
+    sl.onFirstByte(100);
+    sl.onTimeout();
+    expect(sl.slow, true);
+    expect(sl.factor, 2.0);
+    expect(Net.factor, 2.0);
+    expect(sl.offer, true);
+    sl.hideOffer();
+    expect(sl.offer, false);
+    sl.onTimeout();
+    sl.onTimeout();
+    expect(sl.factor, 3.0);
+    sl.onFirstByte(5000);
+    for (var i = 0; i < 2; i++) {
+      sl.onFirstByte(300);
+    }
+    expect(sl.slow, true);
+    sl.onFirstByte(300);
+    expect(sl.slow, false);
+    expect(sl.factor, 1.0);
+    expect(Net.factor, 1.0);
+    expect(sl.offerHidden, false);
+  });
+
+  test('a download that breaks continues where it stopped', () async {
+    final data = List<int>.generate(1000, (i) => i % 251);
+    var calls = 0;
+    String? ifRange;
+    String? rangeHeader;
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((req) async {
+      calls++;
+      final range = req.headers.value('range');
+      if (range == null) {
+        req.response.statusCode = 200;
+        req.response.headers.set('etag', '"v1"');
+        req.response.contentLength = data.length;
+        // The line breaks after 400 of the 1000 bytes.
+        final sock = await req.response.detachSocket();
+        sock.add(data.sublist(0, 400));
+        await sock.flush();
+        sock.destroy();
+        return;
+      }
+      rangeHeader = range;
+      ifRange = req.headers.value('if-range');
+      final from = int.parse(range.substring(6, range.length - 1));
+      req.response.statusCode = 206;
+      req.response.headers.set('content-range', 'bytes $from-${data.length - 1}/${data.length}');
+      req.response.contentLength = data.length - from;
+      req.response.add(data.sublist(from));
+      await req.response.close();
+    });
+    final dir = Directory.systemTemp.createTempSync('aiy_dl');
+    final out = File('${dir.path}/file.bin');
+    var last = 0;
+    await Net.download(Uri.parse('http://127.0.0.1:${server.port}/f'), out, onProgress: (g) => last = g);
+    expect(out.readAsBytesSync().length, 1000);
+    expect(out.readAsBytesSync().toString(), data.toString());
+    expect(calls, 2);
+    expect(rangeHeader, 'bytes=400-');
+    expect(ifRange, '"v1"');
+    expect(last, 1000);
+    expect(File('${out.path}.part').existsSync(), false);
+    // a leftover part of ANOTHER address is not continued
+    File('${out.path}.part').writeAsBytesSync([9, 9, 9]);
+    File('${out.path}.part.url').writeAsStringSync('http://other/\n');
+    calls = 0;
+    rangeHeader = null;
+    out.deleteSync();
+    await Net.download(Uri.parse('http://127.0.0.1:${server.port}/f'), out);
+    expect(rangeHeader == null || rangeHeader == 'bytes=400-', true);
+    expect(out.readAsBytesSync().toString(), data.toString());
+    await server.close(force: true);
+    dir.deleteSync(recursive: true);
   });
 }

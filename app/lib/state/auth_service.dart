@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 import '../firebase_options.dart';
+import 'app_log.dart';
 
 /// A sign-in failure with the REAL code and a plain meaning.
 class AuthFailure implements Exception {
@@ -43,7 +44,9 @@ class AuthService {
     try {
       await _init();
       await GoogleSignIn.instance.signOut();
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('auth_service:46: $e');
+    }
     await _auth.signOut();
   }
 

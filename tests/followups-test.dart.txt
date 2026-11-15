@@ -1,0 +1,11 @@
+import '../lib/logic/followups.dart';
+void main() {
+  var r = splitFollowUps('Hello there.\n\n[[follow-ups: What is X? | How about Y? | Why Z?]]');
+  print(r.text == 'Hello there.' && r.questions.length == 3 ? 'ok tag' : 'FAIL ${r.text}|${r.questions}');
+  r = splitFollowUps('No tag here');
+  print(r.questions.isEmpty && r.text == 'No tag here' ? 'ok none' : 'FAIL');
+  print(hideFollowUpTail('Answer\n[[follow-ups: Wha') == 'Answer' ? 'ok partial' : 'FAIL');
+  print(hideFollowUpTail('Answer [') == 'Answer ' ? 'ok bracket' : 'FAIL');
+  r = splitFollowUps('Text [[Follow-ups: 1. "A question" | - Another one]]  ');
+  print(r.questions.join(',') == 'A question,Another one' ? 'ok clean' : 'FAIL ${r.questions}');
+}

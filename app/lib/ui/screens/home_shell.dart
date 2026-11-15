@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -6,15 +8,21 @@ import 'package:share_plus/share_plus.dart';
 import '../../state/app_builder.dart';
 import '../../state/chat_store.dart';
 import '../../state/code_state.dart';
+import '../../state/error_center.dart';
 import '../../state/share_inbox.dart';
 import '../../state/updater.dart';
 import '../widgets/common.dart';
 import '../widgets/fx.dart';
+import '../widgets/offline_banner.dart';
 import 'build_view.dart';
 import 'chat_view.dart';
 import 'code_view.dart';
 import 'history_screen.dart';
 import 'settings_screen.dart';
+import '../widgets/health_banner.dart';
+import '../widgets/update_banner.dart';
+import '../widgets/markdown.dart';
+import '../widgets/paid_jobs_banner.dart';
 
 /// The app's frame: top bar with the Chat / Code switch, the side menu, and the two modes.
 class HomeShell extends StatefulWidget {
@@ -24,6 +32,27 @@ class HomeShell extends StatefulWidget {
 }
 
 class _HomeShellState extends State<HomeShell> {
+  bool _showingNew = false;
+  @override
+  void initState() {
+    super.initState();
+    // "Ask AIy" on an error card: a new chat with the error in it.
+    ErrorCenter.askAi = (q) {
+      if (!mounted) return;
+      final chat = context.read<ChatStore>();
+      if (chat.busy) return;
+      setState(() => _mode = 0);
+      chat.newChat();
+      unawaited(chat.send(q));
+    };
+  }
+
+  @override
+  void dispose() {
+    ErrorCenter.askAi = null;
+    super.dispose();
+  }
+
   final _scaffold = GlobalKey<ScaffoldState>();
   int _mode = 0; // 0 chat, 1 code, 2 build
   String _search = '';
@@ -83,13 +112,13 @@ class _HomeShellState extends State<HomeShell> {
     setState(() => _mode = pick == 'chat' ? 0 : (pick == 'code' ? 1 : 2));
   }
 
-  Future<String?> _askName(String title, {String initial = '', String ok = 'Save'}) {
+  Future<String?> _askName(String title, {String initial = '', String ok = 'Save', String hint = 'Folder name', int max = 30}) {
     final c = TextEditingController(text: initial);
     return showDialog<String>(
       context: context,
       builder: (d) => AlertDialog(
         title: Text(title),
-        content: TextField(controller: c, autofocus: true, maxLength: 30, textCapitalization: TextCapitalization.sentences, decoration: const InputDecoration(hintText: 'Folder name')),
+        content: TextField(controller: c, autofocus: true, textInputAction: TextInputAction.done, onSubmitted: (v) => Navigator.pop(d, v.trim()), maxLength: max, textCapitalization: TextCapitalization.sentences, decoration: InputDecoration(hintText: hint)),
         actions: [
           TextButton(onPressed: () => Navigator.pop(d), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(d, c.text.trim()), child: Text(ok)),
@@ -176,6 +205,35 @@ class _HomeShellState extends State<HomeShell> {
         _asking = false;
       });
     }
+    if (update.whatsNew != null && !_showingNew) {
+      _showingNew = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        final w = update.whatsNew;
+        if (w != null && mounted) {
+          await showModalBottomSheet<void>(
+            context: context,
+            isScrollControlled: true,
+            showDragHandle: true,
+            builder: (c) => SafeArea(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: MediaQuery.of(c).size.height * 0.7),
+                child: ListView(padding: const EdgeInsets.fromLTRB(20, 0, 20, 20), children: [
+                  Text('AIy is now ${w.versionName}', style: Theme.of(c).textTheme.titleLarge),
+                  const SizedBox(height: 4),
+                  Text("What's new", style: Theme.of(c).textTheme.bodySmall),
+                  const SizedBox(height: 10),
+                  MdText(w.notes),
+                  const SizedBox(height: 16),
+                  FilledButton(onPressed: () => Navigator.pop(c), child: const Text('Got it')),
+                ]),
+              ),
+            ),
+          );
+        }
+        await update.dismissWhatsNew();
+        _showingNew = false;
+      });
+    }
     final user = FirebaseAuth.instance.currentUser;
     final initial = ((user?.displayName ?? user?.email ?? 'A').trim().isEmpty ? 'A' : (user?.displayName ?? user?.email ?? 'A').trim()[0]).toUpperCase();
     final empty = _mode == 0 ? chat.current.messages.isEmpty : (_mode == 1 ? !code.hasSource : builder.current == null);
@@ -194,15 +252,6 @@ class _HomeShellState extends State<HomeShell> {
                 const SizedBox(width: 2),
                 _ModeSwitch(mode: _mode, onChanged: (m) => setState(() => _mode = m)),
                 const Spacer(),
-                if (update.hasUpdate)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 4),
-                    child: FilledButton.tonal(
-                      style: FilledButton.styleFrom(minimumSize: const Size(0, 38), padding: const EdgeInsets.symmetric(horizontal: 14)),
-                      onPressed: () => _open(const SettingsScreen()),
-                      child: const Text('Update'),
-                    ),
-                  ),
                 if (_mode == 0)
                   IconButton(tooltip: 'New chat', icon: const Icon(Icons.edit_square), onPressed: chat.busy ? null : chat.newChat)
                 else if (_mode == 2)
@@ -219,6 +268,19 @@ class _HomeShellState extends State<HomeShell> {
                     child: Text(initial, style: TextStyle(color: t.colorScheme.onPrimary, fontWeight: FontWeight.w700)),
                   ),
                 ),
+              ]),
+            ),
+            // Banners grow and shrink smoothly instead of jumping the page.
+            AnimatedSize(
+              duration: const Duration(milliseconds: 280),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topCenter,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const OfflineBanner(),
+                const SlowLineBanner(),
+                const HealthBanner(),
+                const UpdateBanner(),
+                PaidJobsBanner(onOpen: (tab) => setState(() => _mode = tab)),
               ]),
             ),
             Expanded(
@@ -238,11 +300,25 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
+  /// "Today", "Yesterday", "Previous 7 days", "Older" for the chat list.
+  static String _dayGroup(int ms) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final d = DateTime.fromMillisecondsSinceEpoch(ms);
+    final day = DateTime(d.year, d.month, d.day);
+    final diff = today.difference(day).inDays;
+    if (diff <= 0) return 'TODAY';
+    if (diff == 1) return 'YESTERDAY';
+    if (diff < 7) return 'PREVIOUS 7 DAYS';
+    if (diff < 30) return 'PREVIOUS 30 DAYS';
+    return 'OLDER';
+  }
+
   Widget _drawer(ChatStore chat, CodeState code) {
     final t = Theme.of(context);
     final q = _search.trim().toLowerCase();
     final folder = chat.folders.contains(_folder) ? _folder : '';
-    final list = chat.all.where((c) {
+    final list = chat.sorted.where((c) {
       if (folder.isNotEmpty && c.folder != folder) return false;
       if (q.isEmpty) return true;
       return c.title.toLowerCase().contains(q) || c.messages.any((m) => m.text.toLowerCase().contains(q));
@@ -294,23 +370,33 @@ class _HomeShellState extends State<HomeShell> {
               Padding(padding: const EdgeInsets.only(top: 6, bottom: 6), child: ActionChip(avatar: const Icon(Icons.add_rounded, size: 16), label: const Text('Folder'), onPressed: () => _newFolder(chat))),
             ]),
           ),
-          Padding(padding: const EdgeInsets.fromLTRB(20, 6, 20, 4), child: Text(folder.isEmpty ? 'Chats' : folder, style: t.textTheme.labelMedium?.copyWith(color: t.colorScheme.onSurfaceVariant))),
+          if (folder.isNotEmpty) Padding(padding: const EdgeInsets.fromLTRB(20, 6, 20, 0), child: Text(folder, style: t.textTheme.labelMedium?.copyWith(color: t.colorScheme.onSurfaceVariant))),
           Expanded(
             child: list.isEmpty
-                ? Padding(padding: const EdgeInsets.all(20), child: Text(q.isEmpty ? 'Your chats will appear here.' : 'Nothing found.', style: TextStyle(color: t.colorScheme.onSurfaceVariant)))
+                ? Center(
+                    child: Appear(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(q.isEmpty ? Icons.forum_outlined : Icons.search_off_rounded, size: 44, color: t.colorScheme.primary.withValues(alpha: 0.5)),
+                        const SizedBox(height: 10),
+                        Text(q.isEmpty ? 'Your chats will appear here.' : 'Nothing found.', style: TextStyle(color: t.colorScheme.onSurfaceVariant)),
+                      ]),
+                    ),
+                  )
                 : ListView.builder(
                     padding: EdgeInsets.zero,
                     itemCount: list.length,
                     itemBuilder: (_, i) {
                       final c = list[i];
                       final sel = identical(c, chat.current);
-                      return ListTile(
+                      final group = c.pinned ? 'PINNED' : _dayGroup(c.updated);
+                      final header = i == 0 || (list[i - 1].pinned ? 'PINNED' : _dayGroup(list[i - 1].updated)) != group;
+                      final tile = ListTile(
                         dense: true,
                         selected: sel,
                         selectedTileColor: t.colorScheme.primary.withValues(alpha: 0.12),
                         shape: const StadiumBorder(),
                         contentPadding: const EdgeInsets.only(left: 20, right: 4),
-                        title: Text(c.title.isEmpty ? 'New chat' : c.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        title: Row(children: [if (c.pinned) Padding(padding: const EdgeInsets.only(right: 6), child: Icon(Icons.push_pin_rounded, size: 14, color: t.colorScheme.primary)), Expanded(child: Text(c.title.isEmpty ? 'New chat' : c.title, maxLines: 1, overflow: TextOverflow.ellipsis))]),
                         subtitle: folder.isEmpty && c.folder.isNotEmpty ? Text(c.folder, maxLines: 1, overflow: TextOverflow.ellipsis) : null,
                         trailing: PopupMenuButton<String>(
                           tooltip: 'More',
@@ -318,11 +404,28 @@ class _HomeShellState extends State<HomeShell> {
                           onSelected: (v) async {
                             if (v == 'move') {
                               await _moveSheet(chat, c);
-                            } else if (await confirmDialog(context, 'Delete this chat?', yes: 'Delete')) {
-                              chat.delete(c);
+                            } else if (v == 'pin') {
+                              await chat.togglePin(c);
+                            } else if (v == 'rename') {
+                              final n = await _askName('Rename chat', initial: c.title, hint: 'Chat name', max: 60);
+                              if (n != null && n.isNotEmpty) await chat.rename(c, n);
+                            } else if (v == 'delete') {
+                              if (!chat.softDelete(c)) {
+                                if (mounted) snack(context, 'Wait until the answer is finished, or tap Stop.');
+                                return;
+                              }
+                              if (!mounted) return;
+                              ScaffoldMessenger.of(context)
+                                ..hideCurrentSnackBar()
+                                ..showSnackBar(SnackBar(content: const Text('Chat deleted'), duration: const Duration(seconds: 5), action: SnackBarAction(label: 'Undo', onPressed: chat.undoDelete)));
                             }
                           },
-                          itemBuilder: (_) => const [PopupMenuItem(value: 'move', child: Text('Move to a folder')), PopupMenuItem(value: 'delete', child: Text('Delete'))],
+                          itemBuilder: (_) => [
+                            PopupMenuItem(value: 'pin', child: Text(c.pinned ? 'Unpin' : 'Pin to top')),
+                            const PopupMenuItem(value: 'rename', child: Text('Rename')),
+                            const PopupMenuItem(value: 'move', child: Text('Move to a folder')),
+                            const PopupMenuItem(value: 'delete', child: Text('Delete')),
+                          ],
                         ),
                         onTap: () {
                           chat.open(c);
@@ -330,6 +433,17 @@ class _HomeShellState extends State<HomeShell> {
                           Navigator.pop(context);
                         },
                       );
+                      final row = Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: tile);
+                      final item = !header
+                          ? row
+                          : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+                                child: Text(group, style: t.textTheme.labelSmall?.copyWith(color: t.colorScheme.primary, letterSpacing: 0.6)),
+                              ),
+                              row,
+                            ]);
+                      return i < 12 ? Appear(delay: i * 30, dy: 8, child: item) : item;
                     },
                   ),
           ),
@@ -372,37 +486,79 @@ class _ModeSwitch extends StatelessWidget {
   final ValueChanged<int> onChanged;
   const _ModeSwitch({required this.mode, required this.onChanged});
 
+  static const double _wide = 92, _narrow = 44;
+
   @override
   Widget build(BuildContext context) {
     final s = Theme.of(context).colorScheme;
     const items = [('Chat', Icons.chat_bubble_outline_rounded), ('Code', Icons.code_rounded), ('Build', Icons.construction_rounded)];
+    const dur = Duration(milliseconds: 320);
+    const curve = Curves.easeOutCubic;
     return Container(
       padding: const EdgeInsets.all(3),
-      decoration: BoxDecoration(color: s.surfaceContainerHigh.withValues(alpha: 0.9), borderRadius: BorderRadius.circular(999)),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        for (var i = 0; i < items.length; i++)
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => onChanged(i),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              height: 38,
-              width: mode == i ? 92 : 44,
-              decoration: BoxDecoration(color: mode == i ? s.primary : Colors.transparent, borderRadius: BorderRadius.circular(999)),
-              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Icon(items[i].$2, size: 17, color: mode == i ? s.onPrimary : s.onSurfaceVariant),
-                if (mode == i)
-                  Flexible(
-                    child: Padding(
-                      padding: const EdgeInsets.only(left: 6),
-                      child: Text(items[i].$1, maxLines: 1, softWrap: false, overflow: TextOverflow.clip, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: s.onPrimary)),
-                    ),
-                  ),
-              ]),
+      decoration: BoxDecoration(
+        color: s.surfaceContainerHigh.withValues(alpha: 0.9),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: s.outlineVariant.withValues(alpha: 0.3)),
+      ),
+      child: SizedBox(
+        height: 38,
+        width: _wide + _narrow * (items.length - 1),
+        child: Stack(children: [
+          // One pill slides behind the chosen part.
+          AnimatedPositioned(
+            duration: dur,
+            curve: curve,
+            left: mode * _narrow,
+            top: 0,
+            bottom: 0,
+            width: _wide,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(colors: [s.primary, Color.lerp(s.primary, s.tertiary, 0.45)!]),
+                borderRadius: BorderRadius.circular(999),
+                boxShadow: [BoxShadow(color: s.primary.withValues(alpha: 0.35), blurRadius: 12, offset: const Offset(0, 3))],
+              ),
             ),
           ),
-      ]),
+          Row(children: [
+            for (var i = 0; i < items.length; i++)
+              Semantics(
+                button: true,
+                selected: mode == i,
+                label: items[i].$1,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onChanged(i),
+                  child: AnimatedContainer(
+                    duration: dur,
+                    curve: curve,
+                    width: mode == i ? _wide : _narrow,
+                    child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      AnimatedScale(
+                        scale: mode == i ? 1.08 : 1,
+                        duration: dur,
+                        child: Icon(items[i].$2, size: 17, color: mode == i ? s.onPrimary : s.onSurfaceVariant),
+                      ),
+                      Flexible(
+                        child: AnimatedOpacity(
+                          opacity: mode == i ? 1 : 0,
+                          duration: const Duration(milliseconds: 200),
+                          child: mode == i
+                              ? Padding(
+                                  padding: const EdgeInsets.only(left: 6),
+                                  child: Text(items[i].$1, maxLines: 1, softWrap: false, overflow: TextOverflow.clip, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: s.onPrimary)),
+                                )
+                              : const SizedBox.shrink(),
+                        ),
+                      ),
+                    ]),
+                  ),
+                ),
+              ),
+          ]),
+        ]),
+      ),
     );
   }
 }

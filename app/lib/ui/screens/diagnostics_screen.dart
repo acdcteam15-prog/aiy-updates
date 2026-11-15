@@ -110,11 +110,15 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
       ('Gemini', () => service('gemini', 'Gemini')),
       ('OpenRouter', () => service('openrouter', 'OpenRouter')),
       ('Groq', () => service('groq', 'Groq', optional: true)),
+      ('Mistral', () => service('mistral', 'Mistral', optional: true)),
+      ('Cerebras', () => service('cerebras', 'Cerebras', optional: true)),
+      ('NVIDIA', () => service('nvidia', 'NVIDIA', optional: true)),
+      ('Cloudflare', () => service('cloudflare', 'Cloudflare', optional: true)),
       ('GitHub', () => service('github', 'GitHub', optional: true)),
       ('Model lists', () async {
         final parts = <String>[];
-        for (final id in const ['gemini', 'groq', 'openrouter']) {
-          if (!keys.has(id)) continue;
+        for (final id in AiEngine.chatProviders) {
+          if (!engine.ready(id)) continue;
           await engine.refreshModels(id, force: true);
           parts.add('${AiEngine.names[id]}: ${engine.modelsFor(id).take(2).join(', ')}');
         }

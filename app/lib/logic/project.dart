@@ -59,6 +59,7 @@ bool isSource(String path, int size) {
     if (_ignoredDirs.contains(parts[i])) return false;
   }
   if (_bloatNames.contains(name)) return false;
+  if (name.endsWith('~') || name.endsWith('.swp') || name.endsWith('.orig') || name.endsWith('.bak')) return false;
   if (name.endsWith('.min.js') || name.endsWith('.min.css') || name.endsWith('.g.dart') || name.endsWith('.freezed.dart')) return false;
   final ext = extOf(path);
   if (_binaryExt.contains(ext) || _binaryExt.contains(name.replaceFirst('.', ''))) return false;

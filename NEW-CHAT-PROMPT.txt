@@ -1,4 +1,4 @@
-I am continuing a project called AIy: an Android app for non-technical users (Flutter app + a Windows setup wizard, built the same way as my Dishy app). I attached two files: AIy-v1_4_0.zip (the whole project) and HANDOVER.md.
+I am continuing a project called AIy: an Android app for non-technical users (Flutter app + a Windows setup wizard, built the same way as my Dishy app). I attached two files: AIy-v1_6_0.zip (the whole project) and HANDOVER.md.
 
 1. Read HANDOVER.md completely first, then unzip the project.
 2. Reply in 5 short lines: the version, what is built, what has NOT been tested, and what you need from me next.

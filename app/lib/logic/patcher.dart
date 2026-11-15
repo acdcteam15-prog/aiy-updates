@@ -420,3 +420,48 @@ List<DiffLine> diffLines(String before, String after) {
 }
 
 ({int added, int removed}) diffStats(List<DiffLine> d) => (added: d.where((l) => l.kind == '+').length, removed: d.where((l) => l.kind == '-').length);
+
+// ---------------------------------------------------------------------------------------------- reviewing a change
+/// The changed parts of a diff: each is a run of '+'/'-' lines, [start] to [end] (end not included).
+List<({int start, int end})> diffHunks(List<DiffLine> d) {
+  final out = <({int start, int end})>[];
+  var i = 0;
+  while (i < d.length) {
+    if (d[i].kind == ' ') {
+      i++;
+      continue;
+    }
+    final s = i;
+    while (i < d.length && d[i].kind != ' ') {
+      i++;
+    }
+    out.add((start: s, end: i));
+  }
+  return out;
+}
+
+/// The file with only the kept changes: in a [rejected] part the old lines stay and the new ones are dropped.
+/// [crlf] writes Windows line ends (when the file had them).
+String mergeHunks(List<DiffLine> d, Set<int> rejected, {bool crlf = false}) {
+  final hunks = diffHunks(d);
+  final off = List<bool>.filled(d.length, false);
+  for (var h = 0; h < hunks.length; h++) {
+    if (!rejected.contains(h)) continue;
+    for (var i = hunks[h].start; i < hunks[h].end; i++) {
+      off[i] = true;
+    }
+  }
+  final lines = <String>[];
+  for (var i = 0; i < d.length; i++) {
+    final l = d[i];
+    if (l.kind == ' ') {
+      lines.add(l.text);
+    } else if (l.kind == '+') {
+      if (!off[i]) lines.add(l.text);
+    } else {
+      if (off[i]) lines.add(l.text);
+    }
+  }
+  final t = lines.join('\n');
+  return crlf ? t.replaceAll('\n', '\r\n') : t;
+}

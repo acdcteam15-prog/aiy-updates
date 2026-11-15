@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
 import 'package:path_provider/path_provider.dart';
 
+import '../logic/fixcontext.dart';
 import '../logic/buildlog.dart';
 import '../logic/project.dart';
 import '../logic/versioning.dart';
@@ -18,6 +19,8 @@ import 'keys.dart';
 import 'native.dart';
 import 'net.dart';
 import 'prefs.dart';
+import 'store.dart';
+import 'connectivity.dart';
 
 /// An app built on GitHub and kept on the phone.
 class ApkRecord {
@@ -69,7 +72,13 @@ class BuildPrep {
   final String workflow;
   final bool addWorkflow;
   final Map<String, String?> files;
-  const BuildPrep(this.version, this.kind, this.workflow, this.addWorkflow, this.files);
+
+  /// The project's own workflow with its Android SDK setup step allowed to fail (null when nothing to change).
+  final String? relaxed;
+
+  /// The person agreed to write [relaxed] into the project.
+  bool fixSetup = false;
+  BuildPrep(this.version, this.kind, this.workflow, this.addWorkflow, this.files, {this.relaxed});
 }
 
 class _Up {
@@ -152,13 +161,58 @@ class BuildState extends ChangeNotifier {
     }
   }
 
+  /// When each phase of the current build started (ms since epoch), for the step times on screen.
+  final Map<String, int> phaseAt = {};
+
+  /// The phase the last build or check was in when it failed ('' when none).
+  String failedPhase = '';
+  String _seenPhase = '';
+
+  @override
+  void notifyListeners() {
+    if (phase != _seenPhase) {
+      if (phase == 'failed') failedPhase = _seenPhase;
+      if (phase != 'failed' && phase != 'idle') phaseAt.putIfAbsent(phase, () => DateTime.now().millisecondsSinceEpoch);
+      _seenPhase = phase;
+    }
+    super.notifyListeners();
+  }
+
   void _say(String s, {String? p}) {
     status = s;
     if (p != null) phase = p;
     notifyListeners();
   }
 
+  /// The GitHub step that failed when it is one of the build's SETUP steps (Java, Android SDK, Gradle, Flutter,
+  /// checkout) - not the project's code. '' otherwise. Fixing the code with AI cannot help then.
+  String get setupStepFailed {
+    for (var i = 0; i < steps.length; i++) {
+      final s = steps[i];
+      if (s.state != 'failed') continue;
+      // Only when the run really stopped there (a setup step allowed to fail, with later steps run, does not count).
+      if (steps.skip(i + 1).any((x) => x.state == 'done' || x.state == 'failed' || x.state == 'running')) continue;
+      final n = s.name.toLowerCase();
+      if (n.startsWith('run ') && n.contains('@') && !n.contains('compile') && !n.contains('build the')) return s.name;
+      if (n.startsWith('set up ') || n == 'use one fixed signing key') return s.name;
+    }
+    return '';
+  }
+
+  /// A build failure caused by the build's own setup or a plugin's requirements (not the project's code). '' otherwise.
+  String get environmentProblem {
+    if (phase != 'failed') return '';
+    return environmentFailure('${problems.map((p) => '${p.title} ${p.detail}').join('\n')}\n$log');
+  }
+
+  /// Anything that makes "Fix it with AI" pointless: a failed setup step or an environment problem.
+  bool get aiCannotFix => setupStepFailed.isNotEmpty || environmentProblem.isNotEmpty;
+
+  /// True when the last failure was only the internet connection.
+  bool lastWasConnection = false;
+
   void _fail(Object e, {bool build = false}) {
+    lastWasConnection = e is ApiError && e.isConnection;
     error = e is ApiError ? e.message : 'Something went wrong: $e';
     AppLog.i('github: $error');
     phase = build ? 'failed' : 'idle';
@@ -204,6 +258,9 @@ class BuildState extends ChangeNotifier {
     try {
       error = null;
       progress = 0;
+      // The previous run's steps are not this push's: clear them so "Details" does not show an old failure.
+      steps = [];
+      failedPhase = '';
       _say('Connecting to GitHub…', p: 'pushing');
       final gh = _gh;
       var r = plan.repo, b = plan.base;
@@ -244,7 +301,7 @@ class BuildState extends ChangeNotifier {
         status = 'Uploading files $done / ${list.length}';
         _tick();
       });
-      _say('Saving on GitHub…');
+      _say(list.length > 200 ? 'Saving ${list.length} files on GitHub… (big projects can take a minute or two)' : 'Saving on GitHub…');
       final tree = await gh.createTree(r, baseTree, [for (var i = 0; i < list.length; i++) (list[i].path, isExecutable(list[i].path) ? '100755' : '100644', shas[i]!)]);
       var target = b;
       final ts = DateTime.now();
@@ -304,7 +361,16 @@ class BuildState extends ChangeNotifier {
 
   /// Looks at the repository (which kind of project, which workflow, which version) before the version question.
   Future<BuildPrep?> prepare() async {
-    if ((running && !_loop) || repo.isEmpty) return null;
+    if (running && !_loop) {
+      error = 'A build or quick check is still running. Wait for it, or cancel it in Settings > Running and waiting.';
+      notifyListeners();
+      return null;
+    }
+    if (repo.isEmpty) {
+      error = 'Push the change to GitHub first, then build.';
+      notifyListeners();
+      return null;
+    }
     try {
       error = null;
       _say('Checking the project on GitHub…', p: 'preparing');
@@ -313,14 +379,24 @@ class BuildState extends ChangeNotifier {
       await _parallel(_probe.length, 4, (i) async => t[_probe[i]] = await gh.fileText(repo, _probe[i], branch));
       final kind = detectKind((p) => t[p] != null, (p) => t[p]);
       var workflow = '';
-      for (final n in const [kWorkflowName, 'build.yml', 'build.yaml']) {
-        final x = t['.github/workflows/$n'];
-        if (x != null && x.contains('workflow_dispatch')) {
-          workflow = n;
-          break;
+      var add = false;
+      final own = t['.github/workflows/$kWorkflowName'];
+      if (own != null && kind != ProjectKind.unknown && (!isAiyWorkflow(own) || !isCurrentAiyWorkflow(own))) {
+        // AIy's workflow from an older version (no push trigger): replace it so the build also starts on branches.
+        if (isAiyWorkflow(own)) {
+          workflow = kWorkflowName;
+          add = true;
         }
       }
-      var add = false;
+      if (workflow.isEmpty) {
+        for (final n in const [kWorkflowName, 'build.yml', 'build.yaml']) {
+          final x = t['.github/workflows/$n'];
+          if (x != null && x.contains('workflow_dispatch')) {
+            workflow = n;
+            break;
+          }
+        }
+      }
       if (workflow.isEmpty) {
         if (kind == ProjectKind.unknown) {
           throw ApiError('AIy can build Android (Gradle) and Flutter projects. This repository is neither, and it has no workflow that can be started by hand.');
@@ -331,7 +407,8 @@ class BuildState extends ChangeNotifier {
       phase = 'idle';
       status = '';
       notifyListeners();
-      return BuildPrep(detectVersion((p) => t[p]), kind, workflow, add, t);
+      final ownYaml = workflow != kWorkflowName && !add ? t['.github/workflows/$workflow'] : null;
+      return BuildPrep(detectVersion((p) => t[p]), kind, workflow, add, t, relaxed: ownYaml == null ? null : relaxSetupAndroid(ownYaml));
     } catch (e) {
       _fail(e);
       return null;
@@ -339,6 +416,8 @@ class BuildState extends ChangeNotifier {
   }
 
   void _resetBuild() {
+    phaseAt.clear();
+    failedPhase = '';
     steps = [];
     problems = [];
     log = '';
@@ -353,8 +432,24 @@ class BuildState extends ChangeNotifier {
     _cancel = false;
   }
 
+  String _lastNotes = '';
+  bool _lastRelease = false;
+
+  /// After a build stopped in a setup step (not the code): AIy updates its workflow and builds again with the same
+  /// version, notes and release choice. Nothing is spent on a model.
+  Future<void> rebuildAfterSetup() async {
+    if (running || repo.isEmpty) return;
+    final ver = version;
+    final prep = await prepare();
+    if (prep == null) return;
+    AppLog.i('build: rebuilding after a setup failure (${setupStepFailed.isEmpty ? (environmentProblem.isEmpty ? 'setup step' : environmentProblem) : setupStepFailed})');
+    await start(prep, versionName: ver.isEmpty ? (prep.version?.name ?? '1.0.0') : ver, releaseNotes: _lastNotes, release: _lastRelease);
+  }
+
   Future<void> start(BuildPrep prep, {required String versionName, required String releaseNotes, required bool release}) async {
     if (running && !_loop) return;
+    _lastNotes = releaseNotes;
+    _lastRelease = release;
     _resetBuild();
     version = versionName;
     unawaited(_askNotify());
@@ -362,10 +457,12 @@ class BuildState extends ChangeNotifier {
       _say('Preparing the build…', p: 'preparing');
       final gh = _gh;
       final r = repo, b = branch;
-      var head = await _head(gh, r, b);
-      final baseTree = await gh.commitTree(r, head);
       final adds = <(String, List<int>)>[];
       if (prep.addWorkflow) adds.add(('.github/workflows/$kWorkflowName', utf8.encode(workflowFor(prep.kind)!)));
+      if (prep.fixSetup && prep.relaxed != null) {
+        adds.add(('.github/workflows/${prep.workflow}', utf8.encode(prep.relaxed!)));
+        notes.add('${prep.workflow}: the Android SDK setup step may no longer stop the build');
+      }
       final v = prep.version;
       if (v == null) {
         notes.add('No version number was found in the project, so the version is only used in the file name.');
@@ -382,44 +479,16 @@ class BuildState extends ChangeNotifier {
           notes.add('Version ${v.name} -> $versionName${codeN == null ? '' : ' (build number $codeN)'}');
         }
       }
-      if (adds.isNotEmpty) {
-        _say('Writing version $versionName into the project…');
-        final entries = <(String, String, String)>[];
-        for (final a in adds) {
-          entries.add((a.$1, '100644', await gh.createBlob(r, a.$2)));
-        }
-        final tree = await gh.createTree(r, baseTree, entries);
-        head = await gh.createCommit(r, 'AIy: version $versionName${prep.addWorkflow ? ' and build workflow' : ''}', tree, head);
-        await gh.updateRef(r, b, head);
-      }
-      if (_cancel) return;
-      _say('Starting the build…', p: 'queued');
-      var before = 0;
-      for (final x in await gh.runs(r, prep.workflow, b)) {
-        if (x.id > before) before = x.id;
-      }
-      for (var attempt = 0; attempt < 8; attempt++) {
-        try {
-          await gh.dispatch(r, prep.workflow, b);
-          break;
-        } on ApiError catch (e) {
-          // Right after a commit GitHub needs a moment before it knows the workflow.
-          if (attempt == 7 || (e.status != 404 && e.status != 422 && e.status != 409)) rethrow;
-          await Future<void>.delayed(const Duration(seconds: 5));
-        }
-      }
-      RunInfo? run;
-      for (var i = 0; i < 40 && run == null; i++) {
-        await Future<void>.delayed(const Duration(seconds: 3));
-        if (_cancel) return;
-        for (final x in await gh.runs(r, prep.workflow, b)) {
-          if (x.id > before) {
-            run = x;
-            break;
-          }
-        }
-      }
-      if (run == null) throw ApiError('The build was started, but AIy could not find it. Open the Actions page of $r on GitHub.');
+      final own = prep.workflow == kWorkflowName;
+      if (adds.isNotEmpty) _say('Writing version $versionName into the project…');
+      final run = await _launch(gh, r, b,
+          workflow: prep.workflow,
+          trigger: kBuildTrigger,
+          own: own,
+          adds: adds,
+          message: 'AIy: build version $versionName${prep.addWorkflow ? ' (and the build workflow)' : ''}',
+          what: 'build');
+      if (run == null) return; // cancelled
       await prefs.setActiveBuild(jsonEncode({'repo': r, 'branch': b, 'run': run.id, 'version': versionName, 'notes': releaseNotes, 'release': release, 'check': false}));
       await _watch(gh, r, b, run.id, versionName, releaseNotes, release);
     } catch (e) {
@@ -570,44 +639,21 @@ class BuildState extends ChangeNotifier {
       final t = <String, String?>{};
       await _parallel(probe.length, 4, (i) async => t[probe[i]] = await gh.fileText(r, probe[i], b));
       final yaml = checkWorkflowFor(detectKind((p) => t[p] != null, (p) => t[p]));
-      final has = (t['.github/workflows/$kCheckWorkflowName'] ?? '').contains('workflow_dispatch');
+      final current = t['.github/workflows/$kCheckWorkflowName'];
+      final has = (current ?? '').contains('workflow_dispatch');
       if (yaml == null && !has) throw ApiError('AIy can check Android (Gradle) and Flutter projects. This repository is neither.');
-      var head = await _head(gh, r, b);
-      if (!has) {
-        _say('Adding the check workflow…');
-        final baseTree = await gh.commitTree(r, head);
-        final blob = await gh.createBlob(r, utf8.encode(yaml!));
-        final tree = await gh.createTree(r, baseTree, [('.github/workflows/$kCheckWorkflowName', '100644', blob)]);
-        head = await gh.createCommit(r, 'AIy: quick check workflow', tree, head);
-        await gh.updateRef(r, b, head);
-      }
-      if (_cancel) return;
-      _say('Starting the check…', p: 'queued');
-      var before = 0;
-      for (final x in await gh.runs(r, kCheckWorkflowName, b)) {
-        if (x.id > before) before = x.id;
-      }
-      for (var attempt = 0; attempt < 8; attempt++) {
-        try {
-          await gh.dispatch(r, kCheckWorkflowName, b);
-          break;
-        } on ApiError catch (e) {
-          if (attempt == 7 || (e.status != 404 && e.status != 422 && e.status != 409)) rethrow;
-          await Future<void>.delayed(const Duration(seconds: 5));
-        }
-      }
-      RunInfo? run;
-      for (var i = 0; i < 40 && run == null; i++) {
-        await Future<void>.delayed(const Duration(seconds: 3));
-        if (_cancel) return;
-        for (final x in await gh.runs(r, kCheckWorkflowName, b)) {
-          if (x.id > before) {
-            run = x;
-            break;
-          }
-        }
-      }
-      if (run == null) throw ApiError('The check was started, but AIy could not find it. Open the Actions page of $r on GitHub.');
+      // Add it when missing; replace AIy's older version (no push trigger) so it also starts on branches.
+      final write = yaml != null && (!has || (isAiyWorkflow(current) && !isCurrentAiyWorkflow(current)));
+      final own = yaml != null && (write || isCurrentAiyWorkflow(current));
+      if (write) _say('Adding the check workflow…');
+      final run = await _launch(gh, r, b,
+          workflow: kCheckWorkflowName,
+          trigger: kCheckTrigger,
+          own: own,
+          adds: [if (write) ('.github/workflows/$kCheckWorkflowName', utf8.encode(yaml))],
+          message: 'AIy: quick check',
+          what: 'check');
+      if (run == null) return;
       await prefs.setActiveBuild(jsonEncode({'repo': r, 'branch': b, 'run': run.id, 'version': '', 'notes': '', 'release': false, 'check': true}));
       await _watch(gh, r, b, run.id, '', '', false);
     } catch (e) {
@@ -616,59 +662,291 @@ class BuildState extends ChangeNotifier {
     }
   }
 
+  /// Commits [adds] on the branch and returns the run GitHub started for it (null when cancelled).
+  ///
+  /// AIy's own workflows ([own]) are started by the commit itself: the commit also changes [trigger], and the
+  /// workflow runs on a push that touches it, on ANY branch. Hand-starting ("workflow_dispatch") only works when
+  /// the workflow is on the default branch, so it is used for other workflows, and for AIy's as a second try.
+  Future<RunInfo?> _launch(GitHubApi gh, String r, String b,
+      {required String workflow, required String trigger, required bool own, required List<(String, List<int>)> adds, required String message, required String what}) async {
+    var head = await _head(gh, r, b);
+    var before = 0;
+    try {
+      for (final x in await gh.runs(r, workflow, b, event: '')) {
+        if (x.id > before) before = x.id;
+      }
+    } on ApiError catch (e) {
+      if (e.status != 404) rethrow; // a workflow GitHub does not know yet
+    }
+    final all = [...adds, if (own) (trigger, utf8.encode('AIy $what request ${DateTime.now().toUtc().toIso8601String()}\n'))];
+    if (all.isNotEmpty) {
+      final baseTree = await gh.commitTree(r, head);
+      final entries = <(String, String, String)>[];
+      for (final a in all) {
+        entries.add((a.$1, '100644', await gh.createBlob(r, a.$2)));
+      }
+      final tree = await gh.createTree(r, baseTree, entries);
+      head = await gh.createCommit(r, message, tree, head);
+      try {
+        await gh.updateRef(r, b, head);
+      } on ApiError catch (e) {
+        if (e.status == 404 || e.status == 403) {
+          throw ApiError('GitHub did not let AIy change the workflow files (${e.status}). The GitHub sign-in needs the "workflow" permission: Settings > Accounts & keys, disconnect GitHub and connect it again.', e.status);
+        }
+        if (e.status == 422 && e.message.toLowerCase().contains('protected')) {
+          throw ApiError('The branch $b is protected, so AIy cannot add its commit. Push to a new branch instead (Publish > Push somewhere else).', e.status);
+        }
+        rethrow;
+      }
+    }
+    if (_cancel) return null;
+    _say('Waiting for GitHub to start the $what…', p: 'queued');
+    var dispatched = false;
+    String? lastDispatchError;
+    final until = DateTime.now().add(const Duration(minutes: 4));
+    for (var i = 0; DateTime.now().isBefore(until); i++) {
+      if (_cancel) return null;
+      if (own) {
+        final l = await gh.runsForCommit(r, workflow, head);
+        if (l.isNotEmpty) return l.first;
+        // any newer run on the branch (push or hand-started) also counts
+        try {
+          for (final x in await gh.runs(r, workflow, b, event: '')) {
+            if (x.id > before) return x;
+          }
+        } on ApiError catch (e) {
+          if (e.status != 404) rethrow;
+        }
+      }
+      // Other workflows: start by hand at once. AIy's own: only if the push did not start it within ~60 s.
+      if (!dispatched && (!own || i >= 20)) {
+        try {
+          await gh.dispatch(r, workflow, b);
+          dispatched = true;
+        } on ApiError catch (e) {
+          lastDispatchError = e.message;
+          if (e.status != 404 && e.status != 422 && e.status != 409) rethrow;
+          if (own) dispatched = true; // the default branch does not have it: the push trigger is the way, keep waiting
+        }
+      }
+      if (dispatched) {
+        try {
+          for (final x in await gh.runs(r, workflow, b)) {
+            if (x.id > before) return x;
+          }
+        } on ApiError catch (e) {
+          if (e.status != 404) rethrow;
+        }
+      }
+      if (i > 0 && i % 10 == 0) _say('Waiting for GitHub to start the $what… (${i * 3} s, GitHub can be slow)');
+      await Future<void>.delayed(const Duration(seconds: 3));
+    }
+    final on = await gh.actionsEnabled(r);
+    if (on == false) {
+      throw ApiError('GitHub Actions is switched off for $r, so nothing can be built there. On GitHub: the repository > Settings > Actions > General > "Allow all actions", then try again.');
+    }
+    throw ApiError('GitHub did not start the $what within 4 minutes${lastDispatchError == null ? '' : ' (last answer: $lastDispatchError)'}. '
+        'Open the Actions page of $r on GitHub: if a run is there, AIy will find it when you tap ${what == 'build' ? 'Build' : 'Quick check'} again; '
+        'if GitHub asks to enable workflows for this repository, enable them first.');
+  }
+
   /// After a failed build or check: the model writes a fix, AIy pushes it and checks it on GitHub (quick, no APK),
   /// and repeats up to [rounds] times. When the check passes, the real build starts again. Every fix is limited by the spending limit.
-  Future<void> autoFix(OrModel m, int rounds) async {
+  /// The auto-fix loop stopped because the internet went away. [Continue] starts it again from where it stopped:
+  /// [fixReady] = the fix was already written (and paid for), so only the push and the check are repeated.
+  ({OrModel model, int rounds, bool fixReady})? paused;
+
+  void _pause(OrModel m, int left, bool fixReady) {
+    paused = (model: m, rounds: left, fixReady: fixReady);
+    error = fixReady
+        ? 'Auto-fix paused: the internet went away after the fix was written. The fix is kept. Tap Continue when you are back online (it pushes and checks it; the fix is not paid for again).'
+        : 'Auto-fix paused: the internet went away before the fix was written (nothing was charged for it). Tap Continue when you are back online.';
+    AppLog.i('auto-fix paused (fixReady=$fixReady, rounds left $left)');
+  }
+
+  /// Continues a paused auto-fix loop (the person tapped Continue).
+  Future<void> continueFix() async {
+    final p = paused;
+    if (p == null || _loop) return;
+    paused = null;
+    error = null;
+    phase = 'failed';
+    await autoFix(p.model, p.rounds, fixReady: p.fixReady);
+  }
+
+  void dropPause() {
+    paused = null;
+    notifyListeners();
+  }
+
+  static String _money(double v) => '\$${v.toStringAsFixed(v < 0.01 ? 4 : 2)}';
+
+  /// What the current auto-fix has cost so far (all rounds).
+  double fixSpent = 0;
+
+  Future<File> _fixModelsFile() async => File('${(await getApplicationDocumentsDirectory()).path}/aiy/fix_models.json');
+
+  /// The model that last fixed this kind of error (its id), or null.
+  Future<String?> modelThatFixed(List<Problem> problems) async {
+    try {
+      final j = await Store.readJson(await _fixModelsFile());
+      if (j is Map) return j[errorKind(problems)] as String?;
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _rememberFixer(String kind, String modelId) async {
+    try {
+      final f = await _fixModelsFile();
+      final j = await Store.readJson(f);
+      final m = j is Map ? Map<String, dynamic>.from(j) : <String, dynamic>{};
+      m[kind] = modelId;
+      f.parent.createSync(recursive: true);
+      await Store.writeJson(f, m);
+    } catch (_) {}
+  }
+
+  String get _spentNote => fixSpent > 0 ? ' · spent so far: ${_money(fixSpent)}' : '';
+
+  /// [free] = try this free model first (one round). If its fix does not work, the paid model [m] takes over for
+  /// [rounds] rounds. Nothing is charged for the free round.
+  Future<void> autoFix(OrModel m, int rounds, {bool fixReady = false, OrModel? free}) async {
     if (phase != 'failed' || _loop) return;
+    if (setupStepFailed.isEmpty && environmentProblem.isNotEmpty) {
+      error = 'This is not a mistake in your code: ${environmentProblem}. AI cannot fix it from your files, so AIy did not spend any money. Tap "Update and build again": AIy updates its build so plugins use a new enough Android version.';
+      notifyListeners();
+      return;
+    }
+    if (setupStepFailed.isNotEmpty) {
+      // Nothing in the project's code to fix: do not spend money on a model.
+      error = 'The step "$setupStepFailed" is part of GitHub\'s build setup, not your code, so AI cannot fix it. Tap "Update and build again": AIy updates its build workflow so this step can no longer stop the build.';
+      notifyListeners();
+      return;
+    }
     _loop = true;
     _stopLoop = false;
+    paused = null;
     final ver = version;
     var last = '';
     var same = 0;
     var ok = false;
+    final kind = errorKind(problems);
+    if (!fixReady) fixSpent = 0;
+    final plan = [if (free != null && !m.free && !fixReady) free, for (var k = 0; k < rounds; k++) m];
+    final total = plan.length;
+    OrModel? prevModel;
+    var winner = m;
     try {
-      for (var i = 1; i <= rounds; i++) {
+      for (var i = 1; i <= total; i++) {
         if (_stopLoop) break;
-        final key = problems.isEmpty ? 'log' : problems.first.title;
+        final cur = plan[i - 1];
+        // a free round that fails hands over to the paid model instead of stopping
+        final canEscalate = cur.free && !m.free && i < total;
+        // rounds still to go if the loop pauses now (a paused free round goes on with the paid model)
+        int left() => canEscalate ? total - i : total - i + 1;
+        OrModel resumeWith() => canEscalate ? m : cur;
+        void handOver(String why) {
+          notes.add('Free try with ${cur.name}: $why. Switched to ${m.name}.');
+          error = null;
+          code.clearError();
+          // its unpushed edits are not an "earlier attempt that was built": do not show them to the paid model as one
+          if (!pushed) code.changes = [];
+        }
+        if (prevModel != null && prevModel.id != cur.id) {
+          last = '';
+          same = 0;
+        }
+        prevModel = cur;
+        final key = errorSetKey(problems, log);
         if (key == last && ++same >= 2) {
-          error = 'The same error came back twice, so AIy stopped to save money. Read it below, or try a different model.';
+          error = 'The exact same errors came back after the fix, so AIy stopped to save money${fixSpent > 0 ? ' (spent ${_money(fixSpent)})' : ''}. Read them below, or try a different model.';
           break;
         }
+        if (key != last) same = 0;
         last = key;
-        _say('Fix $i of $rounds: ${m.name} is writing a fix…', p: 'fixing');
-        final msg = code.startFix(problems, log);
-        if (msg != null) {
-          error = msg;
+        final skipPatch = fixReady && i == 1;
+        if (!skipPatch) {
+          _say('Fix $i of $total: ${cur.name}${cur.free ? ' (free)' : ''} is writing a fix…$_spentNote', p: 'fixing');
+          final msg = code.startFix(problems, log);
+          if (msg != null) {
+            error = msg;
+            break;
+          }
+          await code.patch(cur);
+          fixSpent += code.spent;
+        }
+        if (_stopLoop) break;
+        if (!skipPatch && code.heldOffline) {
+          // The Code tab would send the patch again by itself, but then the loop would not go on. Pause the loop instead.
+          Offline.drop(code.heldTitle);
+          code.heldOffline = false;
+          code.clearError();
+          _pause(resumeWith(), left(), false);
           break;
         }
-        await code.patch(m);
-        if (_stopLoop) break;
         if (code.error != null) {
+          if (canEscalate) {
+            handOver('it failed (${code.error})');
+            continue;
+          }
           error = code.error;
           code.clearError();
           break;
         }
         if (!code.hasResult) {
+          if (canEscalate) {
+            handOver('no usable fix');
+            continue;
+          }
           error = 'The model did not give a usable fix.';
           break;
         }
-        _say('Fix $i of $rounds: pushing it…', p: 'fixing');
+        if (!skipPatch && canEscalate && !code.changes.any((c) => c.after != (c.before ?? '\u0000'))) {
+          handOver('its edits did not match your code');
+          continue;
+        }
+        if (!skipPatch && !code.changes.any((c) => c.after != (c.before ?? '\u0000'))) {
+          // Every edit pointed at text that is not in the files: pushing would rebuild the SAME code and fail the same way.
+          error = 'The fix from ${cur.name} did not match your code (its edits point at lines that are not in the files), so nothing would change. AIy stopped before rebuilding, so no build was wasted. Try a stronger model.';
+          break;
+        }
+        _say('Fix $i of $total: pushing it…$_spentNote', p: 'fixing');
         await push(PushPlan(repo: repo, base: branch));
+        if (!_stopLoop && error != null && lastWasConnection) {
+          _pause(resumeWith(), left() + (canEscalate ? 1 : 0), true);
+          break;
+        }
         if (_stopLoop || error != null || !pushed) break;
+        if (status.startsWith('GitHub already had exactly these files')) {
+          if (canEscalate) {
+            handOver('its fix changed nothing');
+            continue;
+          }
+          error = 'The fix changed nothing on GitHub, so checking again would give the same errors. AIy stopped. Try a different model.';
+          break;
+        }
         await check();
         if (_stopLoop) break;
+        if (error != null && lastWasConnection) {
+          // pushed, but the check could not be followed: continuing pushes nothing new and checks again
+          _pause(resumeWith(), left() + (canEscalate ? 1 : 0), true);
+          break;
+        }
         if (phase == 'done') {
           ok = true;
+          winner = cur;
           break;
         }
         if (phase != 'failed') break;
       }
       if (ok && !_stopLoop) {
+        unawaited(_rememberFixer(kind, winner.id));
+        notes.add(fixSpent > 0 ? 'Fixed by ${winner.name} for ${_money(fixSpent)} in total' : 'Fixed by ${winner.name} (free)');
         final prep = await prepare();
         if (prep != null) {
           await start(prep, versionName: ver.isEmpty ? (prep.version?.name ?? '1.0.0') : ver, releaseNotes: 'Fixed by AIy', release: false);
         }
-      } else if (phase == 'fixing' || phase == 'idle') {
+      } else if (phase == 'fixing' || phase == 'idle' || paused != null) {
         phase = 'failed';
       }
     } catch (e) {
@@ -707,7 +985,9 @@ class BuildState extends ChangeNotifier {
     try {
       final s = WidgetsBinding.instance.lifecycleState;
       if (s != null && s != AppLifecycleState.resumed) unawaited(Native.notify(title, text));
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('build_state:711: $e');
+    }
   }
 
   Future<void> _askNotify() async {
@@ -737,8 +1017,8 @@ class BuildState extends ChangeNotifier {
   Future<void> _loadApks() async {
     try {
       final f = await _file();
-      if (f.existsSync()) {
-        final j = jsonDecode(await f.readAsString());
+      {
+        final j = await Store.readJson(f);
         if (j is List) {
           apks = [
             for (final a in j)
@@ -754,10 +1034,25 @@ class BuildState extends ChangeNotifier {
 
   Future<void> _saveApks() async {
     try {
-      await (await _file()).writeAsString(jsonEncode([for (final a in apks) a.toJson()]));
+      await Store.writeJson(await _file(), [for (final a in apks) a.toJson()]);
     } catch (e) {
       debugPrint('apks save: $e');
     }
+  }
+
+  /// Removes every downloaded APK (Settings > Storage).
+  Future<void> deleteAllApks() async {
+    for (final a in apks) {
+      try {
+        final f = File(a.file);
+        if (f.existsSync()) f.deleteSync();
+      } catch (e) {
+        AppLog.i('apk delete: $e');
+      }
+    }
+    apks = [];
+    notifyListeners();
+    await _saveApks();
   }
 
   Future<void> deleteApk(ApkRecord a) async {

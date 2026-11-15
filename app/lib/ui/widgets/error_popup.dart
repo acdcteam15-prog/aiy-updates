@@ -7,6 +7,7 @@ import '../../state/error_center.dart';
 import '../../state/keys.dart';
 import '../../state/net.dart';
 import '../../state/prefs.dart';
+import '../../state/report.dart';
 import '../screens/model_picker.dart';
 import 'common.dart';
 
@@ -27,8 +28,32 @@ Future<void> showAiProblem(AiProblem p) async {
 
 /// Plain words for an error: a short title, what happened, and what to try.
 ({String title, String what, String todo, IconData icon}) explainProblem(ApiError e) {
+  final r = _explainProblem(e);
+  return (title: r.title, what: _withTries(r.what, e), todo: r.todo, icon: r.icon);
+}
+
+/// "AIy already tried 5 times." when it did.
+String _withTries(String what, ApiError e) => e.tries > 1 ? '$what AIy already tried ${e.tries} times.' : what;
+
+({String title, String what, String todo, IconData icon}) _explainProblem(ApiError e) {
   final s = e.status;
   final who = e.model.isEmpty ? 'OpenRouter' : 'OpenRouter (${e.model})';
+  if (Net.isThinkingOnly(e.message)) {
+    return (
+      title: 'The model only thought',
+      what: '$who used all of its answer space on thinking and wrote nothing.',
+      todo: 'Pick a model that does not "think" (tap Try another model), or raise the limit for one request in Settings > Coding.',
+      icon: Icons.psychology_alt_outlined,
+    );
+  }
+  if ((s == 403 || s == 404) && Net.unusableText('${e.message} ${e.detail}'.toLowerCase())) {
+    return (
+      title: 'This model only works in other apps',
+      what: '$who is a batch-only or agent-only model, so it cannot answer AIy. It is now hidden from the model list.',
+      todo: 'Pick another model (any normal free or paid model works).',
+      icon: Icons.block_rounded,
+    );
+  }
   if (s == 401 || s == 403) {
     return (
       title: 'OpenRouter did not accept the key',
@@ -101,6 +126,30 @@ Future<void> showAiProblem(AiProblem p) async {
   );
 }
 
+/// Plain words for a failure that did not come from OpenRouter.
+({String title, String what, String todo, IconData icon}) explainGeneral(ApiError e) {
+  final r = _explainGeneral(e);
+  return (title: r.title, what: _withTries(r.what, e), todo: r.todo, icon: r.icon);
+}
+
+({String title, String what, String todo, IconData icon}) _explainGeneral(ApiError e) {
+  final s = e.status;
+  final who = e.provider.isEmpty ? 'The service' : e.provider;
+  if (s == 401 || s == 403) {
+    return (title: '$who did not accept the sign-in', what: e.message, todo: 'Connect it again in Settings > Accounts & keys.', icon: Icons.key_off_rounded);
+  }
+  if (s == 429) {
+    return (title: '$who limit reached', what: e.message, todo: 'Wait a minute and try again.', icon: Icons.hourglass_bottom_rounded);
+  }
+  if (s != null && s >= 500) {
+    return (title: '$who is busy', what: e.message, todo: 'Try again in a moment.', icon: Icons.cloud_off_rounded);
+  }
+  if (s == null) {
+    return (title: 'Something went wrong', what: e.message, todo: 'Try again. If it happens again, tap "Ask AIy" for an explanation, or "Copy report" and send it to the developer.', icon: Icons.error_outline_rounded);
+  }
+  return (title: '$who had a problem', what: e.message, todo: 'Try again, or tap "Ask AIy" for what to do.', icon: Icons.error_outline_rounded);
+}
+
 class _ProblemDialog extends StatefulWidget {
   final AiProblem p;
   const _ProblemDialog(this.p);
@@ -113,14 +162,27 @@ class _ProblemDialogState extends State<_ProblemDialog> {
 
   String get _report {
     final e = widget.p.error;
-    final sb = StringBuffer('AIy - OpenRouter problem\n');
+    final sb = StringBuffer(widget.p.openRouter ? 'AIy - OpenRouter problem\n' : 'AIy - problem\n');
     if (widget.p.where.isNotEmpty) sb.writeln('While: ${widget.p.where}');
     sb.writeln('Model: ${e.model.isEmpty ? '(unknown)' : e.model}');
     sb.writeln('Status: ${e.status ?? '(none)'}');
     sb.writeln('Message: ${e.message}');
-    if (e.detail.isNotEmpty) sb.writeln('OpenRouter said: ${e.detail}');
+    if (e.detail.isNotEmpty) sb.writeln('${widget.p.openRouter ? 'OpenRouter' : 'The service'} said: ${e.detail}');
     if (widget.p.whole.causes.length > 1) sb.writeln('\nAll attempts:\n${widget.p.whole.message}');
     return sb.toString().trim();
+  }
+
+  Future<void> _copyBundle() async {
+    final text = await ReportBundle.build(error: widget.p.whole, where: widget.p.where);
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) snack(context, 'Report copied (keys removed). Paste it where you need it.');
+  }
+
+  void _ask() {
+    final ask = ErrorCenter.askAi;
+    if (ask == null) return;
+    Navigator.pop(context);
+    ask('AIy showed me this error. Explain in simple words what it means and what I can do about it.\n\n$_report');
   }
 
   void _retry() {
@@ -155,8 +217,9 @@ class _ProblemDialogState extends State<_ProblemDialog> {
     final t = Theme.of(context);
     final s = t.colorScheme;
     final p = widget.p;
-    final w = explainProblem(p.error);
+    final w = p.openRouter ? explainProblem(p.error) : explainGeneral(p.error);
     final canRetry = p.retry != null;
+    final canSwitch = p.openRouter || p.retryWith != null;
     return AlertDialog(
       icon: Icon(w.icon, color: s.error, size: 30),
       title: Text(w.title, textAlign: TextAlign.center),
@@ -200,26 +263,22 @@ class _ProblemDialogState extends State<_ProblemDialog> {
           ]),
         ),
       ),
-      actionsAlignment: MainAxisAlignment.spaceBetween,
-      actionsOverflowAlignment: OverflowBarAlignment.end,
-      actionsOverflowButtonSpacing: 4,
+      actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      // One wrapping block: the buttons go on a second line when the screen is narrow, never off the edge.
       actions: [
-        TextButton(
-          onPressed: () {
-            Clipboard.setData(ClipboardData(text: _report));
-            snack(context, 'Copied');
-          },
-          child: const Text('Copy'),
-        ),
-        Row(mainAxisSize: MainAxisSize.min, children: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
-          const SizedBox(width: 4),
-          OutlinedButton(onPressed: _switch, child: const Text('Switch model')),
-          if (canRetry) ...[
-            const SizedBox(width: 6),
-            FilledButton(onPressed: _retry, child: const Text('Retry')),
+        Wrap(
+          alignment: WrapAlignment.end,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            TextButton(onPressed: _copyBundle, child: const Text('Copy report')),
+            if (ErrorCenter.askAi != null) TextButton(onPressed: _ask, child: const Text('Ask AIy')),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+            if (canSwitch) OutlinedButton(onPressed: _switch, child: Text(p.retryWith != null || p.openRouter ? 'Try another model' : 'Switch model')),
+            if (canRetry) FilledButton(onPressed: _retry, child: const Text('Retry')),
           ],
-        ]),
+        ),
       ],
     );
   }
@@ -256,6 +315,10 @@ class ChooseAiSheet extends StatelessWidget {
           item('', 'Automatic', 'Free ones first, the next one when a limit is reached'),
           item('gemini', 'Gemini first', 'Also the only one that can read PDFs and search the internet', show: keys.has('gemini')),
           item('groq', 'Groq first', 'Fast answers (no photos)', show: keys.has('groq')),
+          item('mistral', 'Mistral first', 'Text only', show: keys.has('mistral')),
+          item('cerebras', 'Cerebras first', 'Very fast, short texts only', show: keys.has('cerebras')),
+          item('nvidia', 'NVIDIA first', 'Text only', show: keys.has('nvidia')),
+          item('cloudflare', 'Cloudflare first', 'Text only', show: keys.has('cloudflare') && keys.has('cloudflare_acct')),
           item('openrouter', 'OpenRouter first', 'Its free router picks a free model for you', show: keys.has('openrouter')),
           if (keys.has('openrouter'))
             ListTile(

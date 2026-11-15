@@ -1,0 +1,12 @@
+import '../lib/logic/project.dart';
+void c(bool b, String m) => print('${b ? 'ok  ' : 'FAIL'} $m');
+void main() {
+  c(commonRoot(['app/a.dart', 'app/b/c.dart']) == 'app/', 'common root');
+  c(commonRoot(['a.dart', 'app/b.dart']) == '', 'no common root');
+  c(isSource('lib/main.dart', 100), 'dart is source');
+  c(!isSource('node_modules/x/a.js', 10), 'node_modules skipped');
+  c(!isSource('assets/logo.PNG', 10), 'picture skipped (upper case)');
+  c(!isSource('lib/a.dart~', 10) && !isSource('src/x.js.orig', 10), 'backup files skipped');
+  c(!isSource('lib/big.dart', 400 * 1024), 'too big skipped');
+  c(parseFileList('```json\n["lib\\\\a.dart", "lib/b.dart"]\n```').join(',') == 'lib/a.dart,lib/b.dart', 'file list parsed');
+}

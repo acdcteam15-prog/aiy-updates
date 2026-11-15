@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
 import '../../logic/patcher.dart';
 import '../../state/code_state.dart';
@@ -13,8 +14,21 @@ class DiffScreen extends StatefulWidget {
 }
 
 class _DiffScreenState extends State<DiffScreen> {
-  late final List<DiffLine> _lines = diffLines(widget.change.before ?? '', widget.change.after);
+  // The diff of what the model WROTE: parts that were turned off stay visible, so they can be turned on again.
+  late final List<DiffLine> _lines = diffLines(widget.change.before ?? '', widget.change.written ?? widget.change.after);
+  late final List<({int start, int end})> _hunks = diffHunks(_lines);
+  late final Map<DiffLine, int> _hunkAt = {for (var h = 0; h < _hunks.length; h++) _lines[_hunks[h].start]: h};
+  late Set<int> _off = {...widget.change.rejected};
   bool _whole = false;
+
+  bool get _canReview => !widget.change.isNew && _hunks.length > 1;
+
+  Future<void> _toggle(int h, bool keep) async {
+    setState(() => keep ? _off.remove(h) : _off.add(h));
+    _off = {..._off};
+    await context.read<CodeState>().reviewChange(widget.change, _off);
+    if (mounted) setState(() {});
+  }
 
   /// Changed lines with 3 lines around them; long unchanged stretches become one "… N lines" row (a null entry).
   List<DiffLine?> _folded() {
@@ -72,6 +86,11 @@ class _DiffScreenState extends State<DiffScreen> {
                   Text(c.path, style: t.textTheme.bodySmall?.copyWith(fontFamily: 'monospace', color: t.colorScheme.onSurfaceVariant)),
                   if (c.problem != null) Padding(padding: const EdgeInsets.only(top: 8), child: ErrorBox('Possible syntax problem after the change: ${c.problem}')),
                   for (final f in c.failures) Padding(padding: const EdgeInsets.only(top: 8), child: ErrorBox('This edit was NOT applied: $f')),
+                  if (_canReview)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text('${_hunks.length} changes in this file. Turn off any you do not want: the file, the zip and the next push follow.', style: t.textTheme.bodySmall),
+                    ),
                 ]),
               );
             }
@@ -84,6 +103,40 @@ class _DiffScreenState extends State<DiffScreen> {
                 child: Text('⋯ ${l.text} unchanged lines', style: t.textTheme.labelSmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
               );
             }
+            final h = _hunkAt[l];
+            final off = h != null && _off.contains(h);
+            final row = _row(t, l, green, red);
+            if (h == null || !_canReview) return _dim(row, l);
+            return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Container(
+                color: t.colorScheme.surfaceContainerHighest,
+                padding: const EdgeInsets.only(left: 12),
+                child: Row(children: [
+                  Expanded(child: Text('Change ${h + 1} of ${_hunks.length}${off ? ' · turned off' : ''}', style: t.textTheme.labelMedium)),
+                  Text(off ? 'Keep' : 'Keep', style: t.textTheme.labelSmall),
+                  Switch(value: !off, onChanged: (v) => _toggle(h, v)),
+                ]),
+              ),
+              _dim(row, l),
+            ]);
+          },
+        ),
+      ),
+    );
+  }
+
+  /// A line of a part that was turned off is shown faded.
+  Widget _dim(Widget row, DiffLine l) {
+    for (final h in _off) {
+      if (h < _hunks.length) {
+        final i = _lines.indexOf(l);
+        if (i >= _hunks[h].start && i < _hunks[h].end) return Opacity(opacity: 0.35, child: row);
+      }
+    }
+    return row;
+  }
+
+  Widget _row(ThemeData t, DiffLine l, Color green, Color red) {
             final bg = l.kind == '+' ? green.withValues(alpha: 0.16) : (l.kind == '-' ? red.withValues(alpha: 0.16) : null);
             final no = l.kind == '-' ? l.oldNo : l.newNo;
             return Container(
@@ -96,9 +149,5 @@ class _DiffScreenState extends State<DiffScreen> {
                 const SizedBox(width: 8),
               ]),
             );
-          },
-        ),
-      ),
-    );
   }
 }

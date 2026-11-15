@@ -4,9 +4,13 @@ import 'dart:io';
 
 import 'app_log.dart';
 import 'github.dart';
+import '../logic/followups.dart';
+import '../logic/lite.dart';
 import 'keys.dart';
 import 'net.dart';
 import 'prefs.dart';
+import '../logic/health.dart';
+import '../logic/retry.dart';
 
 class Source {
   final String title;
@@ -124,7 +128,7 @@ class OrModel {
   bool get free => id.endsWith(':free') || (promptPrice == 0 && completionPrice == 0);
 
   /// Well-known families for coding work (shown first in the picker).
-  bool get coding => RegExp(r'claude|gpt-5|gpt-4\.1|codex|gemini-.*pro|deepseek|qwen.*coder|kimi|grok-code|devstral|codestral|glm', caseSensitive: false).hasMatch(id);
+  bool get coding => RegExp(r'claude|gpt-5|gpt-4\.1|codex|gemini-.*pro|deepseek|qwen.*coder|qwen3|kimi|grok-code|grok-4|devstral|codestral|glm|minimax|mimo', caseSensitive: false).hasMatch(id);
 
   String get priceLabel {
     if (free) return 'Free';
@@ -144,18 +148,51 @@ class AiEngine {
   final LocalPrefs prefs;
   AiEngine(this.keys, this.prefs);
 
-  static const names = {'gemini': 'Gemini', 'groq': 'Groq', 'openrouter': 'OpenRouter', 'github': 'GitHub'};
+  static const names = {
+    'gemini': 'Gemini',
+    'groq': 'Groq',
+    'mistral': 'Mistral',
+    'cerebras': 'Cerebras',
+    'nvidia': 'NVIDIA',
+    'cloudflare': 'Cloudflare',
+    'openrouter': 'OpenRouter',
+    'github': 'GitHub',
+  };
+
+  /// The services that can answer a chat, in the order they are tried (free ones; OpenRouter last).
+  static const chatProviders = ['gemini', 'groq', 'mistral', 'cerebras', 'nvidia', 'cloudflare', 'openrouter'];
+
+  /// True when the service has what it needs (Cloudflare needs an account number as well as a token).
+  bool ready(String pid) => keys.has(pid) && (pid != 'cloudflare' || keys.has('cloudflare_acct'));
 
   /// Used until the real list has been fetched from each service (names are retired often).
   static const seeds = {
     'gemini': ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'],
     'groq': ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'qwen/qwen3.6-27b'],
     'openrouter': ['openrouter/free'],
+    // Model names of these four are checked against the service's own list (once a day); these are the first guesses.
+    'mistral': ['mistral-small-latest', 'open-mistral-nemo', 'mistral-medium-latest'],
+    'cerebras': ['llama-3.3-70b', 'gpt-oss-120b', 'qwen-3-32b'],
+    'nvidia': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'qwen/qwen2.5-coder-32b-instruct'],
+    'cloudflare': ['@cf/meta/llama-3.3-70b-instruct-fp8-fast', '@cf/meta/llama-3.1-8b-instruct'],
   };
 
   static const _geminiBase = 'https://generativelanguage.googleapis.com/v1beta';
   static const _groqBase = 'https://api.groq.com/openai/v1';
   static const _orBase = 'https://openrouter.ai/api/v1';
+  static const _mistralBase = 'https://api.mistral.ai/v1';
+  static const _cerebrasBase = 'https://api.cerebras.ai/v1';
+  static const _nvidiaBase = 'https://integrate.api.nvidia.com/v1';
+
+  /// The OpenAI-style address of a service (Cloudflare's contains the account number).
+  String _base(String pid) => switch (pid) {
+        'groq' => _groqBase,
+        'mistral' => _mistralBase,
+        'cerebras' => _cerebrasBase,
+        'nvidia' => _nvidiaBase,
+        'cloudflare' => 'https://api.cloudflare.com/client/v4/accounts/${keys.get('cloudflare_acct')}/ai/v1',
+        _ => _orBase,
+      };
 
   List<OrModel> _orModels = const [];
 
@@ -163,13 +200,16 @@ class AiEngine {
   List<String> modelsFor(String pid) {
     final cached = prefs.models(pid);
     final list = cached.isNotEmpty ? cached : (seeds[pid] ?? const <String>[]);
-    if (pid == 'openrouter') return ['openrouter/free', ...list.where((m) => m != 'openrouter/free')];
-    return list;
+    final bad = prefs.unusableModels;
+    final ok = list.where((m) => !bad.contains(m) && !m.endsWith(':batch'));
+    if (pid == 'openrouter') return ['openrouter/free', ...ok.where((m) => m != 'openrouter/free')];
+    return ok.toList();
   }
 
   /// Fetches the current model names of one service (at most once a day unless [force]).
   Future<void> refreshModels(String pid, {bool force = false}) async {
     if (!keys.has(pid) && pid != 'openrouter') return;
+    if (pid == 'cloudflare' && !ready(pid)) return;
     final age = DateTime.now().millisecondsSinceEpoch - prefs.modelsAt(pid);
     if (!force && prefs.models(pid).isNotEmpty && age < const Duration(hours: 24).inMilliseconds) return;
     try {
@@ -215,6 +255,30 @@ class AiEngine {
         ];
         final out = (picked.isNotEmpty ? picked : ids).take(3).toList();
         if (out.isNotEmpty) await prefs.setModels('groq', out);
+      } else if (pid == 'mistral' || pid == 'cerebras' || pid == 'nvidia') {
+        final r = await Net.send('GET', Uri.parse('${_base(pid)}/models'), headers: {'Authorization': 'Bearer ${keys.get(pid)}'}, timeoutSec: 30, who: names[pid]!);
+        if (r.status != 200) return;
+        final ids = <String>[
+          for (final m in (jsonDecode(r.body)['data'] as List? ?? const []))
+            if (m is Map) '${m['id'] ?? ''}'
+        ].where((id) => id.isNotEmpty && !RegExp(r'embed|moderation|ocr|rerank|guard|whisper|tts|transcri|vision|image|video|clip|safety|reward|parse', caseSensitive: false).hasMatch(id)).toList();
+        final out = <String>[...seeds[pid]!.where(ids.contains)];
+        if (out.length < 2) {
+          final more = ids.where((id) => !out.contains(id) && (pid == 'mistral' ? id.endsWith('-latest') : RegExp(r'llama|gpt-oss|qwen|nemotron|mistral', caseSensitive: false).hasMatch(id)));
+          out.addAll(more.take(3 - out.length));
+        }
+        if (out.isNotEmpty) await prefs.setModels(pid, out.take(3).toList());
+      } else if (pid == 'cloudflare') {
+        final r = await Net.send('GET', Uri.parse('https://api.cloudflare.com/client/v4/accounts/${keys.get('cloudflare_acct')}/ai/models/search?task=Text%20Generation&per_page=60'),
+            headers: {'Authorization': 'Bearer ${keys.get('cloudflare')}'}, timeoutSec: 30, who: 'Cloudflare');
+        if (r.status != 200) return;
+        final names0 = <String>[
+          for (final m in (jsonDecode(r.body)['result'] as List? ?? const []))
+            if (m is Map) '${m['name'] ?? ''}'
+        ].where((n) => n.startsWith('@cf/') && !RegExp(r'guard|vision|coder|embed|whisper|tts', caseSensitive: false).hasMatch(n)).toList();
+        final out = <String>[...seeds['cloudflare']!.where(names0.contains)];
+        if (out.length < 2) out.addAll(names0.where((n) => !out.contains(n) && RegExp(r'llama|gpt-oss|qwen|mistral|gemma').hasMatch(n)).take(3 - out.length));
+        if (out.isNotEmpty) await prefs.setModels('cloudflare', out.take(3).toList());
       } else if (pid == 'openrouter') {
         final all = await orModels(force: true);
         final free = all.where((m) => m.id.endsWith(':free')).toList()..sort((a, b) => b.context.compareTo(a.context));
@@ -236,12 +300,16 @@ class AiEngine {
       final pricing = m['pricing'];
       double price(String k) => pricing is Map ? (double.tryParse('${pricing[k] ?? '0'}') ?? 0) : 0;
       final id = '${m['id'] ?? ''}';
-      if (id.isEmpty || price('prompt') < 0) continue;
+      // Batch models (":batch") are not answered on the chat address AIy uses, and models marked unusable earlier are hidden.
+      if (id.isEmpty || price('prompt') < 0 || id.endsWith(':batch') || prefs.unusableModels.contains(id)) continue;
       out.add(OrModel(id, '${m['name'] ?? id}', price('prompt'), price('completion'), (m['context_length'] as num?)?.toInt() ?? 0));
     }
     _orModels = out;
     return out;
   }
+
+  /// Recent results per service: services that keep failing are tried last for a while.
+  final HealthBook health = HealthBook();
 
   // ------------------------------------------------------------------ the fallback chain
   List<(String, String)> _chain({required bool vision, String prefer = '', bool onlyGemini = false}) {
@@ -252,15 +320,16 @@ class AiEngine {
       // The Groq text models cannot read photos.
       if (keys.has('groq') && !vision && !onlyGemini)
         for (final m in modelsFor('groq').take(3)) ('groq', m),
+      // The newer free services answer text only (no photos, no PDFs). Two models each keep a failing service quick.
+      for (final pid in const ['mistral', 'cerebras', 'nvidia', 'cloudflare'])
+        if (ready(pid) && !vision && !onlyGemini)
+          for (final m in modelsFor(pid).take(2)) (pid, m),
       if (keys.has('openrouter') && !onlyGemini)
         for (final m in {if (chosen.isNotEmpty) chosen, ...modelsFor('openrouter').take(4)}) ('openrouter', m),
     ];
-    if (prefer.isEmpty) return all;
-    return [...all.where((e) => e.$1 == prefer), ...all.where((e) => e.$1 != prefer)];
+    final preferred = prefer.isEmpty ? all : [...all.where((e) => e.$1 == prefer), ...all.where((e) => e.$1 != prefer)];
+    return health.order(preferred, (e) => e.$1);
   }
-
-  /// The services and models that can answer a chat right now, in the order they are tried.
-  List<(String, String)> chatChain({bool vision = false}) => _chain(vision: vision, prefer: prefs.preferProvider);
 
   ApiError _tag(ApiError e, String pid, String model) =>
       (e.provider.isNotEmpty && e.model.isNotEmpty) ? e : ApiError(e.message, e.status, e.provider.isEmpty ? (names[pid] ?? pid) : e.provider, e.model.isEmpty ? model : e.model, e.detail);
@@ -284,32 +353,49 @@ class AiEngine {
     if (chain.isEmpty) throw ApiError(onlyGemini ? 'PDF files can only be read by Gemini. Connect Gemini in Settings > Accounts & keys.' : 'No AI service is connected yet. Open Settings > Accounts & keys.');
     final errors = <ApiError>[];
     final dead = <String>{};
-    for (final (pid, model) in chain) {
-      if (dead.contains(pid)) continue;
-      if (cancel?.cancelled == true) break;
-      onText?.call('');
-      try {
+    final outcome = await runChain<AiReply>(
+      length: chain.length,
+      cancelled: () => cancel?.cancelled == true,
+      wait: (sec) => _waitFor(sec, cancel),
+      skip: (i) => dead.contains(chain[i].$1),
+      call: (i) async {
+        final (pid, model) = chain[i];
+        onText?.call('');
+        final sw = Stopwatch()..start();
         final r = await call(pid, model);
+        health.success(pid, sw.elapsedMilliseconds);
         await prefs.bumpUsage(pid);
         return r;
-      } on ApiError catch (e) {
+      },
+      onError: (i, e) {
+        final (pid, model) = chain[i];
+        health.failure(pid, status: e.status, timeout: e.timeout, message: e.message);
         errors.add(_tag(e, pid, model));
-        // A rejected key will not get better with another model of the same service.
-        if (e.status == 401 || e.status == 403) dead.add(pid);
+        // A rejected key will not get better with another model of the same service - unless only this model was refused.
+        if (e.status == 401 || (e.status == 403 && !Net.unusableText('${e.message} ${e.detail}'.toLowerCase()))) dead.add(pid);
         // A model that no longer exists: get the current list for next time.
         if (e.status == 404) unawaited(refreshModels(pid, force: true));
-      }
-    }
+        // A model that only works in other apps: never try it again.
+        if ((e.status == 403 || e.status == 404) && Net.unusableText('${e.message} ${e.detail}'.toLowerCase())) {
+          unawaited(prefs.addUnusableModel(model));
+        }
+      },
+    );
+    if (outcome.value != null) return outcome.value as AiReply;
+    final attempts = outcome.attempts;
     if (cancel?.cancelled == true) return AiReply(text: '', provider: '', model: '', stopped: true);
     AppLog.i('AI: ${errors.map((e) => '${e.provider} (${e.model}): ${e.message}').join(' | ')}');
+    // Only the newest failure of every service/model is listed (several rounds would repeat them).
+    final seen = <String>{};
+    final shown = [for (final e in errors.reversed) if (seen.add('${e.provider}|${e.model}')) e].reversed.toList();
     throw ApiError(
-      'No AI service could answer:\n${errors.map((e) => '• ${e.provider} (${e.model}): ${e.message}').join('\n')}',
+      'No AI service could answer:\n${shown.map((e) => '• ${e.provider} (${e.model}): ${e.message}').join('\n')}',
       errors.isEmpty ? null : errors.last.status,
       '',
       '',
       '',
-      errors,
-    );
+      shown,
+    )..tries = attempts;
   }
 
   // ------------------------------------------------------------------ public calls
@@ -318,40 +404,139 @@ class AiEngine {
     return '${n.year}-${n.month.toString().padLeft(2, '0')}-${n.day.toString().padLeft(2, '0')}';
   }
 
+  /// The conversation as Lite mode sends it: the last few messages, long texts and attached files cut short.
+  static List<ChatMsg> _liteHistory(List<ChatMsg> history) {
+    final keep = liteIndexes([for (final m in history) m.isUser]);
+    return [
+      for (final i in keep)
+        ChatMsg(
+          role: history[i].role,
+          text: shorten(history[i].text),
+          imagePath: history[i].imagePath,
+          attach: shorten(history[i].attach, max: 6000, head: 3500, tail: 1500),
+          attachName: history[i].attachName,
+          failed: history[i].failed,
+          ts: history[i].ts,
+        )
+    ];
+  }
+
   /// A chat turn: the whole conversation goes in, one answer comes out (written piece by piece into [onText]).
   Future<AiReply> chat(
     List<ChatMsg> history, {
     required bool search,
     String prefer = '',
     String instructions = '',
+    bool followUps = false,
     ({String pid, String model})? avoid,
     TextSink? onText,
     AiCancel? cancel,
   }) {
     final system = 'You are AIy, a friendly personal assistant. Answer clearly and directly, in the language the person writes in. '
         'Use short Markdown (headings, lists, code blocks) only when it helps. Today is ${_today()}.'
-        '${instructions.trim().isEmpty ? '' : '\nThe person\'s standing instructions, always follow them: ${instructions.trim()}'}';
+        '${instructions.trim().isEmpty ? '' : '\nThe person\'s standing instructions, always follow them: ${instructions.trim()}'}'
+        '${followUps && !prefs.liteMode ? kFollowUpRule : ''}';
+    // Lite mode (slow line): the latest messages only, long texts cut, no live search, a shorter answer.
+    final lite = prefs.liteMode;
+    if (lite) history = _liteHistory(history);
+    final useSearch = search && !lite;
+    final maxOut = lite ? liteMaxAnswerTokens : null;
     final vision = history.isNotEmpty && history.last.imagePath != null;
     final pdf = history.isNotEmpty && (history.last.imagePath ?? '').toLowerCase().endsWith('.pdf');
     return _run((pid, model) async {
-      if (pid == 'gemini') return _gemini(model, history, system: system, search: search, onText: onText, cancel: cancel);
-      final r = await _openAi(pid, model, _openAiMessages(history, system), onText: onText, cancel: cancel);
-      if (search) r.note = 'Live search only works with Gemini, so this answer did not use the internet.';
+      if (pid == 'gemini') return _gemini(model, history, system: system, search: useSearch, onText: onText, cancel: cancel, maxOut: maxOut);
+      final r = await _openAi(pid, model, _openAiMessages(history, system), onText: onText, cancel: cancel, maxTokens: maxOut);
+      if (useSearch) r.note = 'Live search only works with Gemini, so this answer did not use the internet.';
       return r;
     }, vision: vision, prefer: prefer, onlyGemini: pdf, avoid: avoid, onText: onText, cancel: cancel);
   }
 
+  AiCancel _global = AiCancel();
+
+  /// Ends every request of the app's own work that is arriving piece by piece (the "Stop" of the working notification).
+  void stopAll() {
+    _global.cancel();
+    _global = AiCancel();
+  }
+
   /// A single question for the app's own work (file routing, codebase overview). [json]: ask for JSON only.
-  Future<AiReply> ask(String prompt, {String system = '', bool json = false, TextSink? onText}) {
+  Future<AiReply> ask(String prompt, {String system = '', bool json = false, TextSink? onText}) async {
     final history = [ChatMsg(role: 'user', text: prompt)];
-    return _run((pid, model) {
-      if (pid == 'gemini') return _gemini(model, history, system: system, json: json, temperature: 0.2, onText: onText);
-      return _openAi(pid, model, _openAiMessages(history, system), temperature: 0.2, timeoutSec: 120, onText: onText);
-    }, prefer: prefs.preferProvider, onText: onText);
+    final tok = _global;
+    final r = await _run((pid, model) {
+      if (pid == 'gemini') return _gemini(model, history, system: system, json: json, temperature: 0.2, onText: onText, cancel: tok);
+      return _openAi(pid, model, _openAiMessages(history, system), temperature: 0.2, timeoutSec: 120, onText: onText, cancel: tok);
+    }, prefer: prefs.preferProvider, onText: onText, cancel: tok);
+    if (r.stopped) throw ApiError('Stopped.');
+    return r;
   }
 
   /// One request to the OpenRouter model the person chose (no fallback: they picked it and agreed to its price).
-  Future<AiReply> openRouter(String model, String system, String user, {required int maxTokens, TextSink? onText}) async {
+  // ------------------------------------------------------------------ trying again
+  /// Every request is tried up to this many times before an error is shown (see logic/retry.dart).
+  static const maxTries = kMaxTries;
+
+  /// A wait that ends at once when the person stops the job. False = stopped.
+  Future<bool> _waitFor(int seconds, AiCancel? cancel) async {
+    for (var i = 0; i < seconds * 2; i++) {
+      if (cancel?.cancelled == true) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    return cancel?.cancelled != true;
+  }
+
+  /// Free OpenRouter models to use for tries 4 and 5 (never a paid one: the price the person agreed to stays the maximum).
+  List<String> _otherFreeModels(String model) =>
+      modelsFor('openrouter').where((m) => m != model && (m.endsWith(':free') || m == 'openrouter/free')).take(2).toList();
+
+  /// OpenRouter with up to [maxTries] tries: the same model three times, then other free models; thinking models get
+  /// less room to think on the later tries. [onRetry] tells the screen what is happening.
+  Future<AiReply> openRouter(String model, String system, String user, {required int maxTokens, TextSink? onText, bool track = false, void Function(String note)? onRetry}) async {
+    // For a paid model: note what the key has used so far, so a request lost with the connection can be accounted for.
+    final before = track ? await _creditUsed() : null;
+    final tok = _global;
+    final others = _otherFreeModels(model);
+    String modelFor(int attempt) => (attempt <= 3 || others.isEmpty) ? model : others[(attempt - 4) % others.length];
+    ApiError? last;
+    var thinkLevel = 0;
+    var made = 0;
+    for (var attempt = 1; attempt <= maxTries; attempt++) {
+      final useModel = modelFor(attempt);
+      if (attempt > 1) {
+        onText?.call('');
+        AppLog.i('openrouter: try $attempt of $maxTries with $useModel');
+      }
+      made = attempt;
+      try {
+        return await _openRouterOnce(useModel, system, user, maxTokens: maxTokens, onText: onText, thinkLevel: thinkLevel);
+      } on ApiError catch (e) {
+        last = e;
+        if ((e.status == 403 || e.status == 404) && Net.unusableText('${e.message} ${e.detail}'.toLowerCase())) {
+          AppLog.i('openrouter: $useModel cannot be used here; hidden from the lists');
+          await prefs.addUnusableModel(useModel);
+          _orModels = _orModels.where((m) => m.id != useModel).toList();
+        }
+        if (before != null && e.isConnection && useModel == model) {
+          e.lostCost = () async {
+            final now = await _creditUsed();
+            return now == null ? 0.0 : (now - before).clamp(0.0, double.infinity).toDouble();
+          };
+        }
+        if (tok.cancelled || !isRetryable(e) || attempt == maxTries) break;
+        if (Net.isThinkingOnly(e.message)) thinkLevel++;
+        onRetry?.call('Try ${attempt + 1} of $maxTries${modelFor(attempt + 1) == model ? '' : ' with another model'}…');
+        if (!await _waitFor(kWaits[attempt - 1], tok)) break;
+      }
+    }
+    last!.tries = made;
+    throw last;
+  }
+
+  /// One request to OpenRouter. [thinkLevel]: 0 = a quarter of the allowance may be used for thinking, 1 = a little,
+  /// 2 or more = as little as the model allows.
+  Future<AiReply> _openRouterOnce(String model, String system, String user, {required int maxTokens, TextSink? onText, int thinkLevel = 0}) async {
+    final tok = _global;
+    final Map<String, dynamic>? reasoning = thinkLevel == 0 ? null : (thinkLevel == 1 ? {'max_tokens': 1024, 'exclude': true} : {'effort': 'low', 'exclude': true});
     final r = await _openAi(
       'openrouter',
       model,
@@ -363,9 +548,25 @@ class AiEngine {
       maxTokens: maxTokens,
       timeoutSec: 420,
       onText: onText,
+      cancel: tok,
+      reasoning: reasoning,
     );
     await prefs.bumpUsage('openrouter');
+    if (r.stopped) throw ApiError('Stopped.');
     return r;
+  }
+
+  /// Money the OpenRouter key has used so far; null when it cannot be asked (no internet, no key).
+  Future<double?> _creditUsed() async {
+    if (!keys.has('openrouter')) return null;
+    try {
+      final r = await Net.send('GET', Uri.parse('$_orBase/key'), headers: {'Authorization': 'Bearer ${keys.get('openrouter')}'}, timeoutSec: 8, who: 'OpenRouter');
+      if (r.status != 200) return null;
+      final d = (jsonDecode(r.body) as Map)['data'];
+      return d is Map ? (d['usage'] as num?)?.toDouble() : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// What OpenRouter says about the key: the money used so far and, when the key has a limit, what is left.
@@ -391,6 +592,26 @@ class AiEngine {
         if (r.status != 200) throw Net.fail('Groq', r.status, r.body);
         unawaited(refreshModels('groq', force: true));
         return 'Groq key works.';
+      case 'mistral':
+      case 'cerebras':
+      case 'nvidia':
+      case 'cloudflare':
+        if (pid == 'cloudflare' && !keys.has('cloudflare_acct')) throw ApiError('The Cloudflare account number is missing.');
+        // One tiny question proves the key, the account and the model at once.
+        final probe = [ChatMsg(role: 'user', text: 'Say OK.')];
+        final models = modelsFor(pid);
+        Object? lastErr;
+        for (final m in models.take(2)) {
+          try {
+            await _openAi(pid, m, _openAiMessages(probe, ''), maxTokens: 8, timeoutSec: 40);
+            unawaited(refreshModels(pid, force: true));
+            return '${names[pid]} key works.';
+          } on ApiError catch (e) {
+            lastErr = e;
+            if (e.status == 401 || e.status == 403) break;
+          }
+        }
+        throw lastErr is ApiError ? lastErr : ApiError('${names[pid]} did not answer.');
       case 'openrouter':
         final r = await Net.send('GET', Uri.parse('$_orBase/key'), headers: {'Authorization': 'Bearer $key'}, timeoutSec: 30, who: 'OpenRouter');
         if (r.status != 200) throw Net.fail('OpenRouter', r.status, r.body);
@@ -399,7 +620,9 @@ class AiEngine {
         try {
           final d = jsonDecode(r.body)['data'];
           if (d is Map && d['limit_remaining'] is num) extra = ' Credit left: \$${(d['limit_remaining'] as num).toStringAsFixed(2)}.';
-        } catch (_) {}
+        } catch (e) {
+          AppLog.i('ai:557: $e');
+        }
         return 'OpenRouter key works.$extra';
       default:
         final r = await Net.send('GET', Uri.parse('https://api.github.com/user'),
@@ -436,7 +659,7 @@ class AiEngine {
   /// A rough token count (about 4 letters each) for when a service does not report its usage while streaming.
   static int _guessTokens(int chars) => (chars / 4).ceil();
 
-  Future<AiReply> _gemini(String model, List<ChatMsg> history, {String system = '', bool search = false, bool json = false, double temperature = 0.7, TextSink? onText, AiCancel? cancel}) async {
+  Future<AiReply> _gemini(String model, List<ChatMsg> history, {String system = '', bool search = false, bool json = false, double temperature = 0.7, TextSink? onText, AiCancel? cancel, int? maxOut}) async {
     final li = _lastImage(history);
     final contents = <Map<String, dynamic>>[];
     for (var i = 0; i < history.length; i++) {
@@ -465,7 +688,7 @@ class AiEngine {
             'tools': [
               {'google_search': <String, dynamic>{}}
             ],
-          'generationConfig': {'temperature': temperature, if (json) 'responseMimeType': 'application/json'},
+          'generationConfig': {'temperature': temperature, if (maxOut != null) 'maxOutputTokens': maxOut, if (json) 'responseMimeType': 'application/json'},
         };
     final acc = _GeminiAnswer();
     Future<void> run(bool withSearch) async {
@@ -566,16 +789,39 @@ class AiEngine {
     return n;
   }
 
-  Future<AiReply> _openAi(String pid, String model, List<Map<String, dynamic>> messages, {double temperature = 0.7, int? maxTokens, int timeoutSec = 120, TextSink? onText, AiCancel? cancel}) async {
+  Future<AiReply> _openAi(String pid, String model, List<Map<String, dynamic>> messages, {double temperature = 0.7, int? maxTokens, int timeoutSec = 120, TextSink? onText, AiCancel? cancel, Map<String, dynamic>? reasoning}) async {
     final who = names[pid] ?? pid;
-    final url = Uri.parse('${pid == 'groq' ? _groqBase : _orBase}/chat/completions');
+    final url = Uri.parse('${_base(pid)}/chat/completions');
+    // Cerebras' free plan reads about 8,000 tokens: a longer request would only fail, so it is left to the next service.
+    if (pid == 'cerebras' && _messageChars(messages) > 24000) throw ApiError('The request is too long for the free Cerebras plan.', 413, who, model);
     final headers = {
       'Authorization': 'Bearer ${keys.get(pid)}',
       if (pid == 'openrouter') 'HTTP-Referer': 'https://aiy.app',
       if (pid == 'openrouter') 'X-Title': 'AIy',
     };
-    final payload = {'model': model, 'temperature': temperature, if (maxTokens != null) 'max_tokens': maxTokens, 'messages': messages};
-    if (onText != null) return _openAiStream(who, model, url, headers, payload, messages, timeoutSec, onText, cancel);
+    final payload = {
+      'model': model,
+      'temperature': temperature,
+      if (maxTokens != null) 'max_tokens': maxTokens,
+      'messages': messages,
+      // Thinking models: at most a quarter of the allowance for thinking, so the rest is left for writing.
+      // Models that do not think ignore this; the thinking itself is not sent back.
+      if (pid == 'openrouter' && reasoning != null)
+        'reasoning': reasoning
+      else if (pid == 'openrouter' && maxTokens != null && maxTokens >= 4000)
+        'reasoning': {'max_tokens': maxTokens ~/ 4, 'exclude': true},
+    };
+    if (onText != null) {
+      try {
+        return await _openAiStream(who, model, url, headers, payload, messages, timeoutSec, onText, cancel);
+      } on ApiError catch (e) {
+        // A model that refuses the thinking limit: once more without it.
+        if (e.status != 400 || !payload.containsKey('reasoning') || !'${e.message} ${e.detail}'.toLowerCase().contains('reason')) rethrow;
+        AppLog.i('$who: $model refused the thinking limit; sending without it');
+        payload.remove('reasoning');
+        return _openAiStream(who, model, url, headers, payload, messages, timeoutSec, onText, cancel);
+      }
+    }
     final r = await Net.send('POST', url, headers: headers, json: payload, timeoutSec: timeoutSec, who: who);
     if (r.status != 200) throw Net.fail(who, r.status, r.body, model: model);
     dynamic j;
@@ -653,6 +899,9 @@ class AiEngine {
     final stopped = cancel?.cancelled == true;
     if (sb.toString().trim().isEmpty && !stopped) {
       if (finish == 'error') throw ApiError('$who stopped before it wrote anything (the model had a problem).', 502, who, model);
+      if (finish == 'length') {
+        throw ApiError('$who used its whole answer allowance on thinking and wrote nothing. Pick a model that does not "think", or raise the spending limit for one request in Settings > Coding.', 502, who, model);
+      }
       throw ApiError('$who gave an empty answer.', null, who, model);
     }
     final text = sb.toString().trim();

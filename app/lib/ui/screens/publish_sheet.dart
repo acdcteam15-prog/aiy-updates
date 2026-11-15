@@ -179,6 +179,8 @@ class _PushSheetState extends State<PushSheet> {
           Expanded(
             child: _branches == null
                 ? Align(alignment: Alignment.centerLeft, child: _error != null ? Text(_error!, style: TextStyle(color: t.colorScheme.error)) : const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
+                : _branches!.isEmpty
+                ? Align(alignment: Alignment.centerLeft, child: Text('This repository has no branches yet: the first push creates one.', style: TextStyle(color: t.colorScheme.onSurfaceVariant)))
                 : DropdownButton<String>(
                     isExpanded: true,
                     value: _branches!.contains(_base) ? _base : _branches!.first,

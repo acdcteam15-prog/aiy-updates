@@ -1,0 +1,40 @@
+import '../lib/logic/retry.dart';
+import '../lib/state/net.dart';
+int ok = 0, bad = 0;
+void c(bool b, String m) { if (b) ok++; else bad++; print('${b ? 'ok  ' : 'FAIL'} $m'); }
+Future<ChainOutcome<String>> run(int n, ApiError? Function(int idx, int call) fail, {Set<int>? deadIn, List<int>? waits, bool Function()? cancelled}) async {
+  var call = 0; final w = waits ?? []; final dead = deadIn ?? <int>{};
+  return runChain<String>(length: n, cancelled: cancelled, wait: (s) async { w.add(s); return true; }, skip: (i) => dead.contains(i),
+    onError: (i, e) { if (e.status == 401) dead.add(i); },
+    call: (i) async { call++; final e = fail(i, call); if (e != null) throw e; return 'answer from $i (call $call)'; });
+}
+Future<void> main() async {
+  var w = <int>[];
+  var o = await run(1, (i, k) => ApiError('busy', 503), waits: w);
+  c(o.value == null && o.attempts == 5, 'one service, busy forever: 5 tries (${o.attempts})');
+  c(w.join(',') == '2,4,8,10', 'waits between tries: ${w.join(',')}');
+  o = await run(1, (i, k) => k < 3 ? ApiError('busy', 503) : null);
+  c(o.value != null && o.attempts == 3, 'one service, works on try 3');
+  w = []; o = await run(3, (i, k) => ApiError('busy', 503), waits: w);
+  c(o.attempts >= 5 && o.attempts == 3 + 2 + 3, 'three services all busy: ${o.attempts} tries over two rounds, waits ${w.join(',')}');
+  o = await run(3, (i, k) => i == 0 ? ApiError('busy', 503) : null);
+  c(o.value == 'answer from 1 (call 4)', 'first model fails 3 times, then the next answers: ${o.value}');
+  o = await run(3, (i, k) => ApiError('key rejected', 401));
+  c(o.value == null && o.attempts == 3, 'wrong key: no repeats, each service once (${o.attempts})');
+  o = await run(1, (i, k) => ApiError('not found', 404));
+  c(o.attempts == 1, 'model not found: 1 try only');
+  o = await run(1, (i, k) => ApiError('credit', 402));
+  c(o.attempts == 1, 'no credit: 1 try only');
+  o = await run(1, (i, k) => ApiError('x cannot be used with the chat/completions endpoint', 404));
+  c(o.attempts == 1, 'unusable model: 1 try only');
+  w = []; o = await run(4, (i, k) => ApiError('No internet connection (x).', -1), waits: w);
+  c(o.value == null && o.attempts == 5, 'no internet, 4 services: 5 tries, not 4 services x rounds (${o.attempts}), waits ${w.join(',')}');
+  o = await run(1, (i, k) => k == 4 ? null : ApiError('OpenRouter used its whole answer allowance on thinking and wrote nothing.', 502));
+  c(o.value != null && o.attempts == 4, 'thinking-only is retried');
+  o = await run(1, (i, k) => ApiError('too big', 413));
+  c(o.attempts == 5, 'request too big is retried too (5)');
+  var calls = 0;
+  o = await runChain<String>(length: 1, cancelled: () => calls >= 2, wait: (s) async => true, skip: (i) => false, onError: (i, e) {}, call: (i) async { calls++; throw ApiError('busy', 503); });
+  c(o.attempts == 2, 'stop ends the tries at once (${o.attempts})');
+  print('--- $ok ok, $bad failed');
+}

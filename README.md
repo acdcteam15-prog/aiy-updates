@@ -40,7 +40,7 @@ Nothing else to install. No server: everything runs on the phone.
 ## How it works
 
 - **Keys** are encrypted with a key held in the Android Keystore and never leave the phone except to the service they belong to.
-- **Chat** tries Gemini (flash, then flash-lite), then Groq, then OpenRouter's free models. Model names are fetched
+- **Chat** tries Gemini (flash, then flash-lite), then Groq, Mistral, Cerebras, NVIDIA and Cloudflare (those you connected; text only), then OpenRouter's free models. Model names are fetched
   from each service once a day, so retired names do not break the app.
   Answers are streamed (server-sent events), so the text appears while it is written; Stop keeps what arrived.
   When a service does not report token counts while streaming, the spending log uses an estimate (about 4 letters per token).
@@ -48,6 +48,14 @@ Nothing else to install. No server: everything runs on the phone.
   shows its price first. Chat only ever offers free models.
 - **Share into AIy.** The wizard adds `SEND` / `SEND_MULTIPLE` filters to MainActivity (text, images, PDF, zip). The shared
   files are copied into the app's cache, then the app asks: Chat, Code or Build.
+- **Background.** `BackgroundWork` watches the chat, Code, Build and GitHub-build state and the waiting list; while anything runs it shows the
+  foreground-service notification (`AIyWorkService.kt`, data-sync type) with the current step; Stop calls `engine.stopAll()`, `chat.stop()` and `cancelAll()`.
+  Chat messages (`note: waiting`) and Build projects (`wt`) remember a request that waited for the internet and put it back on the list at the next start.
+- **Slow line.** `SlowLine` reads timeouts/stalls (`Net.onTimeout`) and first-answer times (`Net.onFirstByte`); two timeouts in ten minutes set `Net.factor` to 2 (4 events: 3), which
+  stretches every wait, and offer Lite mode (`logic/lite.dart`, `prefs.liteMode`). `Net.download` keeps `<file>.part` and `<file>.part.url` (address + ETag) and continues with Range / If-Range.
+- **No internet.** A request that fails because of the connection waits in `ConnectivityService` and is sent again, one by one, when a probe
+  (gstatic / openrouter.ai) succeeds. At most 3 resends per job. A lost paid OpenRouter request is accounted for by comparing the key's `usage`
+  before and after.
 - **Simple / Advanced** (Settings). Simple hides model names and the "which AI answers" menu. **Chat folders** live in the menu.
 - **Code**
   1. The zip is scanned on the phone. `node_modules`, `.git`, `build`, `.gradle`, `dist`, `__pycache__`, media and

@@ -26,6 +26,7 @@ import 'build_screen.dart';
 import 'diff_screen.dart';
 import 'publish_panel.dart';
 import 'model_picker.dart';
+import '../widgets/progress_panel.dart';
 
 /// Programming Mode: project -> request -> files -> model and cost -> patch -> new zip or pull request.
 class CodeView extends StatefulWidget {
@@ -241,19 +242,10 @@ class _CodeViewState extends State<CodeView> {
             child: AnimatedOpacity(
               opacity: code.isBusy ? 1 : 0,
               duration: const Duration(milliseconds: 220),
-              child: Material(
-                color: t.colorScheme.inverseSurface,
-                borderRadius: BorderRadius.circular(999),
-                elevation: 6,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  child: Row(children: [
-                    const Orb(size: 28, busy: true),
-                    const SizedBox(width: 12),
-                    Expanded(child: Text(code.busy, maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(color: t.colorScheme.onInverseSurface, fontWeight: FontWeight.w600))),
-                  ]),
-                ),
-              ),
+              child: Builder(builder: (_) {
+                final pr = codeProgress(code.busy);
+                return ProgressPanel(icon: Icons.code_rounded, title: 'Code', steps: pr.steps, at: pr.at, live: code.busy);
+              }),
             ),
           ),
         ),
@@ -298,6 +290,34 @@ class _CodeViewState extends State<CodeView> {
       big(Icons.folder_zip_outlined, 'Upload a project zip', 'Up to 100 MB. Heavy folders are skipped automatically.', code.pickZip, 200),
       const SizedBox(height: 12),
       big(Icons.code_rounded, 'Open a GitHub repository', 'Pick a repository and a branch.', () => _github(code), 280),
+      // Quick way back into the last projects AIy changed.
+      if (code.history.any((h) => File(h.zip).existsSync())) ...[
+        Padding(padding: const EdgeInsets.fromLTRB(4, 26, 4, 8), child: Text('Continue where you left off', style: t.textTheme.titleSmall?.copyWith(color: t.colorScheme.primary))),
+        for (final (i, h) in code.history.where((h) => File(h.zip).existsSync()).take(3).indexed)
+          Appear(
+            delay: 340 + i * 60,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Pressable(
+                onTap: code.isBusy ? null : () => code.openBuild(h),
+                child: StepCard(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 10, 12),
+                  child: Row(children: [
+                    Icon(h.repo.isEmpty ? Icons.folder_zip_outlined : Icons.code_rounded, size: 20, color: t.colorScheme.onSurfaceVariant),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(h.source, maxLines: 1, overflow: TextOverflow.ellipsis, style: t.textTheme.titleSmall),
+                        Text('${h.request.split('\n').first} · ${fmtDate(h.date)}', maxLines: 1, overflow: TextOverflow.ellipsis, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
+                      ]),
+                    ),
+                    const Icon(Icons.chevron_right_rounded),
+                  ]),
+                ),
+              ),
+            ),
+          ),
+      ],
     ]);
   }
 

@@ -10,7 +10,8 @@ import '../widgets/common.dart';
 import '../widgets/qr_dialog.dart';
 import 'autofix_sheet.dart';
 import '../widgets/fx.dart';
-import '../widgets/timeline.dart';
+import '../widgets/build_steps.dart';
+import '../widgets/job_stepper.dart';
 
 /// Follows a build on GitHub: steps, then the APK (install, save, share) or the errors (fix with AI).
 class BuildScreen extends StatelessWidget {
@@ -55,21 +56,41 @@ class BuildScreen extends StatelessWidget {
               ]),
               if (running) ...[
                 const SizedBox(height: 14),
-                LinearProgressIndicator(value: b.phase == 'building' && b.progress > 0 ? b.progress : null, borderRadius: BorderRadius.circular(8), minHeight: 6),
+                ShineBar(value: buildView(b).percent),
                 const SizedBox(height: 10),
                 Text('A build takes a few minutes. You can leave AIy: the build keeps running on GitHub, and AIy picks it up again when you come back.', style: sub),
               ],
             ]),
           ),
-          if (b.error != null) ...[const SizedBox(height: 12), ErrorBox(b.error!, onClose: b.clearError)],
-          if (running || done || failed) ...[const SizedBox(height: 12), Appear(child: StepCard(child: StepTimeline(_bigSteps(b, running, done, failed))))],
+          // A failed build or check explains itself under the step where it stopped; other errors keep the box.
+          if (b.error != null && !failed) ...[const SizedBox(height: 12), ErrorBox(b.error!, onClose: b.clearError)],
+          if (running || done || failed) ...[
+            const SizedBox(height: 12),
+            Appear(
+              child: StepCard(
+                child: Builder(builder: (_) {
+                  final v = buildView(b);
+                  return JobStepper(steps: v.steps, error: v.error);
+                }),
+              ),
+            ),
+          ],
           if (b.steps.isNotEmpty) ...[
             const SizedBox(height: 12),
             Appear(
               child: StepCard(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Steps', style: t.textTheme.titleSmall),
-                  const SizedBox(height: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                child: ExpansionTile(
+                  // Folded by default: the big steps above say enough. Opens by itself when something failed.
+                  key: ValueKey('details-${b.phase == 'failed'}'),
+                  initiallyExpanded: b.phase == 'failed' || b.steps.any((s) => s.state == 'failed'),
+                  shape: const Border(),
+                  collapsedShape: const Border(),
+                  title: Text('Details', style: t.textTheme.titleSmall),
+                  subtitle: Text('${b.steps.where((s) => s.state == 'done').length} of ${b.steps.length} GitHub steps done${b.steps.any((s) => s.state == 'failed') ? ' · 1 failed' : ''}', style: t.textTheme.bodySmall),
+                  childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
                   for (final s in b.steps)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -82,12 +103,13 @@ class BuildScreen extends StatelessWidget {
                               'done' => const Icon(Icons.check_rounded, key: ValueKey('d'), size: 18, color: green),
                               'failed' => Icon(Icons.close_rounded, key: const ValueKey('f'), size: 18, color: t.colorScheme.error),
                               'running' => const SizedBox(key: ValueKey('r'), width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                              'skipped' => Icon(Icons.remove_rounded, key: const ValueKey('s'), size: 16, color: t.colorScheme.onSurfaceVariant),
                               _ => Icon(Icons.circle_outlined, key: const ValueKey('w'), size: 14, color: t.colorScheme.onSurfaceVariant),
                             },
                           ),
                         ),
                         const SizedBox(width: 8),
-                        Expanded(child: Text(s.name, style: t.textTheme.bodyMedium?.copyWith(color: s.state == 'waiting' ? t.colorScheme.onSurfaceVariant : null))),
+                        Expanded(child: Text(s.state == 'skipped' ? '${s.name} (not run)' : s.name, style: t.textTheme.bodyMedium?.copyWith(color: s.state == 'waiting' || s.state == 'skipped' ? t.colorScheme.onSurfaceVariant : null))),
                       ]),
                     ),
                 ]),
@@ -193,6 +215,12 @@ class _Failed extends StatelessWidget {
     final code = Provider.of<CodeState>(context, listen: false);
     return StepCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        if (b.aiCannotFix) ...[
+          Text(b.setupStepFailed.isNotEmpty
+              ? 'GitHub\'s build setup failed ("${b.setupStepFailed}"). This is not a problem in your code, so "Fix it with AI" cannot help: tap "Update and build again" below.'
+              : 'This is not a mistake in your code: ${b.environmentProblem}. "Fix it with AI" cannot solve it (it only sees your files), so it is switched off to save you money. Tap "Update and build again": AIy updates its build so plugins use a new enough Android version.', style: t.textTheme.bodyMedium),
+          const SizedBox(height: 10),
+        ],
         Text(b.problems.isEmpty ? 'AIy could not pick out a single error from the log. Open the log below or the run on GitHub.' : 'What went wrong', style: t.textTheme.titleSmall),
         const SizedBox(height: 6),
         for (final p in b.problems.take(8))
@@ -222,16 +250,32 @@ class _Failed extends StatelessWidget {
           ),
         const SizedBox(height: 10),
         Wrap(spacing: 8, runSpacing: 8, children: [
-          FilledButton.icon(
+          if (b.paused != null) ...[
+            FilledButton.icon(
+              style: FilledButton.styleFrom(minimumSize: const Size(64, 46)),
+              onPressed: () => b.continueFix(),
+              icon: const Icon(Icons.play_arrow_rounded, size: 18),
+              label: Text('Continue auto-fix (${b.paused!.rounds} round${b.paused!.rounds == 1 ? '' : 's'} left)'),
+            ),
+            TextButton(onPressed: b.dropPause, child: const Text('Stop auto-fix')),
+          ],
+          if (b.aiCannotFix)
+            FilledButton.icon(
+              style: FilledButton.styleFrom(minimumSize: const Size(64, 46)),
+              onPressed: () => b.rebuildAfterSetup(),
+              icon: const Icon(Icons.restart_alt_rounded, size: 18),
+              label: const Text('Update and build again'),
+            ),
+          if (b.paused == null && !b.aiCannotFix) FilledButton.icon(
             style: FilledButton.styleFrom(minimumSize: const Size(64, 46)),
             onPressed: () async {
-              final r = await showModalBottomSheet<(OrModel, int)>(context: context, isScrollControlled: true, useSafeArea: true, builder: (_) => const AutoFixSheet());
-              if (r != null) b.autoFix(r.$1, r.$2);
+              final r = await showModalBottomSheet<(OrModel, int, OrModel?)>(context: context, isScrollControlled: true, useSafeArea: true, builder: (_) => const AutoFixSheet());
+              if (r != null) b.autoFix(r.$1, r.$2, free: r.$3);
             },
             icon: const Icon(Icons.autorenew_rounded, size: 18),
             label: const Text('Fix and rebuild automatically'),
           ),
-          OutlinedButton.icon(
+          if (!b.aiCannotFix) OutlinedButton.icon(
             onPressed: () {
               final m = code.startFix(b.problems, b.log);
               if (m != null) {
@@ -261,33 +305,3 @@ class _Failed extends StatelessWidget {
 }
 
 /// The big picture: send the code, build (or check) it on GitHub, download the app, install it.
-List<TimelineStep> _bigSteps(BuildState b, bool running, bool done, bool failed) {
-  final check = b.checkOnly;
-  // 0 = sending, 1 = building, 2 = downloading, 3 = ready
-  var at = 0;
-  switch (b.phase) {
-    case 'queued':
-    case 'building':
-    case 'fixing':
-      at = 1;
-    case 'downloading':
-      at = 2;
-    case 'done':
-      at = 3;
-    case 'failed':
-      // A run address means GitHub had started: the failure is in the build itself.
-      at = b.runUrl.isNotEmpty ? 1 : 0;
-  }
-  String st(int i) {
-    if (failed) return i < at ? 'done' : (i == at ? 'failed' : 'waiting');
-    if (done) return 'done';
-    return i < at ? 'done' : (i == at ? 'active' : 'waiting');
-  }
-
-  return [
-    TimelineStep('Send the code to GitHub', st(0)),
-    TimelineStep(check ? 'Check the code' : 'Build the app', st(1), note: b.phase == 'fixing' ? 'Fixing errors automatically' : (b.phase == 'queued' ? 'Waiting for GitHub to start' : '')),
-    if (!check) TimelineStep('Download the app', st(2)),
-    if (!check) TimelineStep('Install it on this phone', done ? 'active' : 'waiting', note: done ? 'Tap Install below' : ''),
-  ];
-}

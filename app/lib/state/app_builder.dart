@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -11,6 +10,7 @@ import '../ui/theme.dart';
 import '../ui/widgets/icon_maker.dart';
 import 'ai.dart';
 import 'app_log.dart';
+import 'connectivity.dart';
 import 'error_center.dart';
 import 'code_state.dart';
 import 'keys.dart';
@@ -18,6 +18,8 @@ import 'native.dart';
 import 'net.dart';
 import 'prefs.dart';
 import 'spend.dart';
+import 'store.dart';
+import 'paid_jobs.dart';
 
 class QA {
   String q;
@@ -55,13 +57,16 @@ class AppProject {
   double cost = 0;
   String model = '';
   List<String> problems = [];
+
+  /// A free step (the next question, the brief) that was waiting for the internet when AIy was closed.
+  String waiting = '';
   AppProject(this.id);
 
   String get title => name.trim().isNotEmpty ? name.trim() : (idea.trim().isEmpty ? 'New app' : (idea.trim().length > 32 ? '${idea.trim().substring(0, 32)}…' : idea.trim()));
 
   Map<String, dynamic> toJson() => {
         'id': id, 'name': name, 'idea': idea, 'count': count, 'preset': preset, 'mode': mode, 'icon': icon, 'qa': [for (final q in qa) q.toJson()], 'pos': pos,
-        'brief': brief, 'stage': stage, 'updated': updated, 'files': files, 'zip': zip, 'cost': cost, 'model': model, 'problems': problems,
+        'brief': brief, 'stage': stage, 'updated': updated, 'files': files, 'zip': zip, 'cost': cost, 'model': model, 'problems': problems, if (waiting.isNotEmpty) 'wt': waiting,
       };
 
   factory AppProject.fromJson(Map<String, dynamic> j) {
@@ -79,6 +84,7 @@ class AppProject {
       ..zip = '${j['zip'] ?? ''}'
       ..cost = (j['cost'] as num?)?.toDouble() ?? 0
       ..model = '${j['model'] ?? ''}'
+      ..waiting = '${j['wt'] ?? ''}'
       ..problems = [for (final x in (j['problems'] as List? ?? const [])) '$x'];
     p.qa = [
       for (final q in (j['qa'] as List? ?? const []))
@@ -135,11 +141,18 @@ class AppBuilder extends ChangeNotifier {
   Future<void> _load() async {
     try {
       final out = <AppProject>[];
+      final seen = <String>{};
       for (final f in (await _dir()).listSync()) {
-        if (f is File && f.path.endsWith('.json')) {
-          try {
-            out.add(AppProject.fromJson(jsonDecode(await f.readAsString()) as Map<String, dynamic>));
-          } catch (_) {}
+        // .json files, plus a .json.bak whose .json is missing (the app stopped in the middle of a save)
+        if (f is! File) continue;
+        var path = f.path;
+        if (path.endsWith('.json.bak')) path = path.substring(0, path.length - 4);
+        if (!path.endsWith('.json') || !seen.add(path)) continue;
+        try {
+          final j = await Store.readJson(File(path));
+          if (j is Map) out.add(AppProject.fromJson(Map<String, dynamic>.from(j)));
+        } catch (e) {
+          AppLog.i('project load ${path.split('/').last}: $e');
         }
       }
       out.sort((a, b) => b.updated.compareTo(a.updated));
@@ -148,6 +161,42 @@ class AppBuilder extends ChangeNotifier {
       debugPrint('projects load: $e');
     }
     notifyListeners();
+    for (final p in projects.where((p) => p.waiting.isNotEmpty)) {
+      _restoreWaiting(p);
+    }
+  }
+
+  /// After a restart: a question or brief that was waiting for the internet is asked for again as soon as it works.
+  /// (Writing a whole app with a paid model is never started by itself after a restart: the price is shown first.)
+  void _restoreWaiting(AppProject p) {
+    final w = p.waiting;
+    Offline.restore(
+      title: 'App "${p.title}"',
+      onCancel: () {
+        p.waiting = '';
+        unawaited(_write(p));
+      },
+      run: () async {
+        if (isBusy) return;
+        current = p;
+        p.waiting = '';
+        error = null;
+        notifyListeners();
+        if (w == 'question') {
+          await _ask();
+        } else if (w == 'brief') {
+          await writeBrief();
+        }
+      },
+    );
+  }
+
+  Future<void> _write(AppProject p) async {
+    try {
+      await Store.writeJson(File('${(await _dir()).path}/${p.id}.json'), p.toJson());
+    } catch (e) {
+      debugPrint('project save: $e');
+    }
   }
 
   Future<void> save() async {
@@ -156,11 +205,7 @@ class AppBuilder extends ChangeNotifier {
     p.updated = DateTime.now().millisecondsSinceEpoch;
     if (!projects.contains(p)) projects.insert(0, p);
     projects.sort((a, b) => b.updated.compareTo(a.updated));
-    try {
-      await File('${(await _dir()).path}/${p.id}.json').writeAsString(jsonEncode(p.toJson()));
-    } catch (e) {
-      debugPrint('project save: $e');
-    }
+    await _write(p);
   }
 
   void newProject() {
@@ -169,6 +214,53 @@ class AppBuilder extends ChangeNotifier {
     error = null;
     names = [];
     notifyListeners();
+  }
+
+  Future<File> _partialFile(String id) async => File('${(await _dir()).path}/$id.partial');
+
+  Future<Map<String, String>> _loadPartial(String id) async {
+    try {
+      final j = await Store.readJson(await _partialFile(id));
+      if (j is Map) return {for (final e in j.entries) '${e.key}': '${e.value}'};
+    } catch (e) {
+      AppLog.i('partial load: $e');
+    }
+    return {};
+  }
+
+  Future<void> _savePartial(String id, Map<String, String> files) async {
+    try {
+      await Store.writeJson(await _partialFile(id), files);
+    } catch (e) {
+      AppLog.i('partial save: $e');
+    }
+  }
+
+  void _dropPartial(String id) {
+    unawaited(_partialFile(id).then(Store.delete));
+  }
+
+  /// Continues writing an app that was waiting when AIy was closed (only after the person said yes, with the price shown).
+  Future<void> resumePaid(PaidJob j) async {
+    if (isBusy) return;
+    await PaidJobs.instance.done(j.id);
+    final p = projects.where((x) => x.id == '${j.data['project']}').firstOrNull;
+    if (p == null) {
+      error = 'The app idea of this job was deleted, so it cannot continue (nothing was charged).';
+      notifyListeners();
+      return;
+    }
+    open(p);
+    try {
+      busy = 'Finding ${j.modelName}…';
+      notifyListeners();
+      final m = (await engine.orModels()).where((x) => x.id == j.modelId).firstOrNull;
+      busy = '';
+      if (m == null) throw ApiError('The model ${j.modelName} is no longer offered by OpenRouter. Pick another model to write the app.');
+      await generate(m);
+    } catch (e) {
+      _fail(e);
+    }
   }
 
   void open(AppProject p) {
@@ -197,10 +289,13 @@ class AppBuilder extends ChangeNotifier {
   Future<void> delete(AppProject p) async {
     projects.remove(p);
     if (identical(current, p)) current = null;
+    Store.delete(File('${(await _dir()).path}/${p.id}.json'));
+    Store.delete(File('${(await _dir()).path}/${p.id}.partial'));
     try {
-      File('${(await _dir()).path}/${p.id}.json').deleteSync();
-      if (p.zip.isNotEmpty) File(p.zip).deleteSync();
-    } catch (_) {}
+      if (p.zip.isNotEmpty && File(p.zip).existsSync()) File(p.zip).deleteSync();
+    } catch (e) {
+      AppLog.i('project zip delete: $e');
+    }
     notifyListeners();
   }
 
@@ -209,14 +304,48 @@ class AppBuilder extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _fail(Object e, {String where = '', Future<void> Function()? retry, Future<void> Function(OrModel m)? retryWith, String modelId = ''}) {
+  void _fail(Object e, {String where = '', Future<void> Function()? retry, Future<void> Function(OrModel m)? retryWith, String modelId = '', String resume = '', PaidJob? paid}) {
+    // No internet: the job waits and is sent again by itself when the connection is back.
+    // A paid job is also written to the phone, so after a restart AIy can ask (with the price) whether to continue.
+    final proj = current;
+    if (retry != null &&
+        where.isNotEmpty &&
+        Offline.hold(e, title: where, run: () async {
+          if (paid != null) {
+            // A paid job never restarts by itself: the person sees the price again and decides.
+            await PaidJobs.instance.askNow(paid.id);
+            return;
+          }
+          if (proj == null || isBusy) return;
+          current = proj;
+          proj.waiting = '';
+          await retry();
+        }, onCancel: () {
+          if (paid != null) unawaited(PaidJobs.instance.done(paid.id));
+          if (proj != null) {
+            proj.waiting = '';
+            unawaited(_write(proj));
+          }
+        })) {
+      if (paid != null) unawaited(PaidJobs.instance.hold(paid));
+      if (proj != null && resume.isNotEmpty) {
+        proj.waiting = resume;
+        unawaited(_write(proj));
+      }
+      busy = '';
+      phase = '';
+      liveText = '';
+      error = 'No internet. "$where" will be sent again by itself when the connection is back.';
+      notifyListeners();
+      return;
+    }
     busy = '';
     phase = '';
     liveText = '';
     error = e is ApiError ? e.message : 'Something went wrong: $e';
     AppLog.i('build tab: $error');
     notifyListeners();
-    ErrorCenter.report(e, where: where, retry: retry, retryWith: retryWith, modelId: modelId, costOf: (m) {
+    ErrorCenter.report(e, where: where, retry: retry, retryWith: retryWith, modelId: modelId, general: true, costOf: (m) {
       final est = estimate(m);
       return (cost: est.cost, worst: est.worstCase);
     });
@@ -308,7 +437,7 @@ class AppBuilder extends ChangeNotifier {
       await save();
       notifyListeners();
     } catch (e) {
-      _fail(e, where: 'Thinking of the next question', retry: _ask);
+      _fail(e, where: 'Thinking of the next question', retry: _ask, resume: 'question');
     }
   }
 
@@ -385,15 +514,8 @@ class AppBuilder extends ChangeNotifier {
       await save();
       notifyListeners();
     } catch (e) {
-      _fail(e, where: 'Writing the app brief', retry: writeBrief);
+      _fail(e, where: 'Writing the app brief', retry: writeBrief, resume: 'brief');
     }
-  }
-
-  Future<void> setBrief(String t) async {
-    final p = current;
-    if (p == null) return;
-    p.brief = t;
-    await save();
   }
 
   Future<void> toWrite() async {
@@ -435,6 +557,7 @@ class AppBuilder extends ChangeNotifier {
       }
     }
     final worst = m.free ? 0.0 : inTok * m.promptPrice + maxTok * m.completionPrice;
+    if (!m.free && blocked == null) blocked = spend?.budgetBlock(worst, dayCap: prefs.dayCapUsd, monthCap: prefs.monthCapUsd);
     return CostEstimate(inTok, outTok, cost, worst, maxTok, blocked);
   }
 
@@ -475,13 +598,86 @@ class AppBuilder extends ChangeNotifier {
         final r = await engine.ask(planPrompt(p.brief, p.name), system: 'You are a senior Flutter developer planning a small app.', json: true);
         plan = parsePlan(r.text);
       } on ApiError {
-        // The free services are busy: the model writes the files it needs on its own.
+        // The free services are busy: ask the chosen model for the plan instead.
+      }
+      if (plan.isEmpty) {
+        try {
+          final r = await engine.openRouter(m.id, 'You are a senior Flutter developer planning a small app. Answer with JSON only.', planPrompt(p.brief, p.name), maxTokens: 6000, track: !m.free, onRetry: (n) {
+            busy = 'Planning: $n';
+            notifyListeners();
+          });
+          spent += m.free ? 0 : r.inTokens * m.promptPrice + r.outTokens * m.completionPrice;
+          plan = parsePlan(r.text);
+        } on ApiError catch (e) {
+          AppLog.i('build tab: plan with ${m.name} failed: ${e.message}');
+        }
       }
       final system = genSystem(pkg);
-      final files = <String, String>{};
+      // Files finished in an earlier try that stopped part-way are kept: only the missing parts are written.
+      final files = <String, String>{...await _loadPartial(p.id)};
       var problems = <String>[];
       var cut = false;
-      for (var round = 0; round < 3; round++) {
+      var startRound = 0;
+      if (plan.isNotEmpty) {
+        // ---- writing in parts: every part has its own full allowance, so thinking models also have room to write.
+        final size = m.context >= 128000 ? 4 : (m.context >= 32000 ? 3 : 2);
+        final todo = [for (final f in plan) if (!files.containsKey(f.path)) f.path];
+        final parts = <List<String>>[for (var i = 0; i < todo.length; i += size) todo.sublist(i, (i + size).clamp(0, todo.length))];
+        if (files.isNotEmpty) AppLog.i('build tab: continuing, ${files.length} file(s) were already written');
+        for (var pi = 0; pi < parts.length; pi++) {
+          final part = parts[pi];
+          final user = genUser(brief: p.brief, name: p.name, pkg: pkg, themeNote: themeNote(p), plan: plan, written: files, only: part);
+          final inTok = estimateTokens(system) + estimateTokens(user);
+          var maxTok = 16000;
+          if (!m.free && m.completionPrice > 0) {
+            maxTok = ((cap - spent - inTok * m.promptPrice) / m.completionPrice).floor().clamp(0, 16000);
+          }
+          if (maxTok < 1500) {
+            throw ApiError('Your limit of \$${cap.toStringAsFixed(2)} was used up after ${files.length} file(s). The finished files are kept: raise the limit in Settings > Coding and tap write again to continue.');
+          }
+          Map<String, String> got = {};
+          for (var attempt = 0; attempt < 2 && got.isEmpty; attempt++) {
+            busy = 'Part ${pi + 1} of ${parts.length}${attempt == 0 ? '' : ' (again)'}: ${part.map((x) => x.split('/').last).join(', ')}';
+            phase = 'write';
+            round = 1;
+            fileCount = files.length;
+            fileNow = part.first;
+            notifyListeners();
+            try {
+              final r = await engine.openRouter(m.id, system, user, maxTokens: maxTok, track: !m.free, onRetry: (n) {
+                busy = 'Part ${pi + 1} of ${parts.length}: $n';
+                notifyListeners();
+              }, onText: (t) {
+                if (t.isEmpty) return;
+                final pr = writingProgress(t);
+                fileNow = pr.current;
+                busy = 'Part ${pi + 1} of ${parts.length}: ${pr.current.isEmpty ? part.map((x) => x.split('/').last).join(', ') : pr.current.split('/').last}';
+                _live();
+              });
+              spent += m.free ? 0 : r.inTokens * m.promptPrice + r.outTokens * m.completionPrice;
+              cut = r.cut;
+              got = parseFiles(r.text);
+            } on ApiError catch (e) {
+              // The engine already tried 5 times (3 with this model, then 2 with other free ones).
+              AppLog.i('build tab: part ${pi + 1} failed after ${e.tries} tries: ${e.message}');
+              rethrow;
+            }
+          }
+          if (got.isEmpty) {
+            throw ApiError('Part ${pi + 1} of ${parts.length} (${part.join(', ')}) came back without files. The ${files.length} finished file(s) are kept: tap write again to continue, or pick another model.');
+          }
+          files.addAll(got);
+          if (files.containsKey('pubspec.yaml')) files['pubspec.yaml'] = fixPubspec(files['pubspec.yaml']!, pkg);
+          await _savePartial(p.id, files);
+        }
+        // ---- linking: the whole project is checked; the fix rounds below repair what does not fit together.
+        busy = 'Linking the parts and checking the project…';
+        phase = 'check';
+        notifyListeners();
+        problems = checkProject(files, pkg);
+        startRound = 1;
+      }
+      for (var round = startRound; round < 3 && (round == 0 || problems.isNotEmpty); round++) {
         final missing = [for (final f in plan) if (!files.containsKey(f.path)) f.path];
         final only = round == 0 ? <String>[] : _targets(problems, missing);
         final user = genUser(
@@ -509,7 +705,10 @@ class AppBuilder extends ChangeNotifier {
         fileCount = 0;
         fileNow = '';
         notifyListeners();
-        final r = await engine.openRouter(m.id, system, user, maxTokens: maxTok, onText: (t) {
+        final r = await engine.openRouter(m.id, system, user, maxTokens: maxTok, track: !m.free, onRetry: (n) {
+          busy = 'Fixing: $n';
+          notifyListeners();
+        }, onText: (t) {
           if (t.isEmpty) return;
           final pr = writingProgress(t);
           fileCount = pr.count;
@@ -534,6 +733,7 @@ class AppBuilder extends ChangeNotifier {
         notifyListeners();
       }
       if (files.isEmpty) throw ApiError('No files were written.');
+      _dropPartial(p.id);
       busy = 'Making the zip and the icon…';
       phase = 'zip';
       notifyListeners();
@@ -560,7 +760,23 @@ class AppBuilder extends ChangeNotifier {
         notifyListeners();
       }
     } catch (e) {
-      _fail(e, where: 'Writing the app with ${m.name}', retry: () => generate(m), retryWith: generate, modelId: m.id);
+      _fail(e,
+          where: 'Writing the app with ${m.name}',
+          retry: () => generate(m),
+          retryWith: generate,
+          modelId: m.id,
+          paid: m.free
+              ? null
+              : PaidJob(
+                  id: 'app:${p.id}',
+                  kind: 'app',
+                  title: 'Build: writing "${p.title}"',
+                  modelId: m.id,
+                  modelName: m.name,
+                  cost: est.cost,
+                  worst: est.worstCase,
+                  data: {'project': p.id},
+                ));
     }
   }
 

@@ -20,6 +20,7 @@ import '../widgets/common.dart';
 import '../widgets/error_popup.dart';
 import '../widgets/fx.dart';
 import '../widgets/markdown.dart';
+import '../widgets/progress_panel.dart';
 
 const _suggestions = [
   (Icons.lightbulb_outline_rounded, 'Explain something simply', 'Explain how the internet works in simple words.'),
@@ -38,6 +39,8 @@ class ChatView extends StatefulWidget {
 class _ChatViewState extends State<ChatView> {
   final _text = TextEditingController();
   final _scroll = ScrollController();
+  late final Map<String, String> _drafts = context.read<LocalPrefs>().drafts;
+  Timer? _draftSave;
   final _stt = SpeechToText();
   bool _listening = false;
   String? _image;
@@ -51,15 +54,33 @@ class _ChatViewState extends State<ChatView> {
   @override
   void initState() {
     super.initState();
+    _scroll.addListener(_onScroll);
+    // The unsent text is saved a moment after typing stops, so it survives closing AIy.
+    _text.addListener(() {
+      if (_conv.isEmpty || (_drafts[_conv] ?? '') == _text.text) return;
+      _drafts[_conv] = _text.text;
+      _draftSave?.cancel();
+      _draftSave = Timer(const Duration(milliseconds: 800), () => context.read<LocalPrefs>().saveDrafts(_drafts));
+    });
     _text.addListener(() => setState(() {}));
   }
 
   @override
   void dispose() {
     _stt.stop();
+    _draftSave?.cancel();
     _text.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  /// Shows the round "jump to the newest message" button once the person has scrolled up.
+  bool _away = false;
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final p = _scroll.position;
+    final away = p.maxScrollExtent - p.pixels > 400;
+    if (away != _away && mounted) setState(() => _away = away);
   }
 
   void _toEnd({bool jump = false}) {
@@ -182,6 +203,7 @@ class _ChatViewState extends State<ChatView> {
       _listening = false;
     });
     _text.clear();
+    if (!mounted) return;
     FocusScope.of(context).unfocus();
     await store.send(text, imagePath: img, attach: ft, attachName: fn);
   }
@@ -327,6 +349,17 @@ class _ChatViewState extends State<ChatView> {
     } else if (!store.busy) {
       _streamLen = 0;
     }
+    if (store.current.id != _conv) {
+      // Each chat keeps its own unsent text.
+      if (_conv.isNotEmpty) _drafts[_conv] = _text.text;
+      final d = _drafts[store.current.id] ?? '';
+      // Not during build: changing the box repaints the composer.
+      if (_text.text != d) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _text.value = TextEditingValue(text: d, selection: TextSelection.collapsed(offset: d.length));
+        });
+      }
+    }
     if (count != _seen || store.current.id != _conv) {
       _toEnd(jump: _seen == 0 || store.current.id != _conv);
       _seen = count;
@@ -334,7 +367,8 @@ class _ChatViewState extends State<ChatView> {
     }
     return Column(children: [
       Expanded(
-        child: AnimatedSwitcher(
+        child: Stack(children: [
+          Positioned.fill(child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 300),
           child: msgs.isEmpty
               ? _Welcome(key: const ValueKey('welcome'), listening: _listening, onPick: (s) => s.isEmpty ? _attach() : _send(s))
@@ -348,9 +382,23 @@ class _ChatViewState extends State<ChatView> {
                       if (i >= msgs.length) {
                         // Before the first words: the orb thinks. Then the answer appears as it is written.
                         if (store.streamText.isEmpty) {
+                          // Same look as the job pages, small: the step running now and what is happening.
                           return const Padding(
                             padding: EdgeInsets.symmetric(vertical: 10),
-                            child: Row(children: [Orb(size: 30, mode: OrbMode.thinking), SizedBox(width: 12), ThinkingDots()]),
+                            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Orb(size: 30, mode: OrbMode.thinking),
+                              SizedBox(width: 12),
+                              Expanded(
+                                child: ProgressPanel(
+                                  compact: true,
+                                  icon: Icons.chat_bubble_outline_rounded,
+                                  title: 'Answer',
+                                  steps: ['Read your message', 'Think', 'Write the answer'],
+                                  at: 1,
+                                  live: 'Asking the fastest AI service that is free right now',
+                                ),
+                              ),
+                            ]),
                           );
                         }
                         return Padding(
@@ -368,12 +416,39 @@ class _ChatViewState extends State<ChatView> {
                               if (mounted) setState(() => _text.text = t);
                             })
                           : _Answer(m, reveal: m.ts == store.revealTs, last: i == msgs.length - 1, advanced: context.watch<LocalPrefs>().advanced, onTick: () => _toEnd(jump: true), onRetry: store.retry, onMore: () => _answerMenu(m, i == msgs.length - 1));
+                      final newDay = i == 0 || !_sameDay(msgs[i - 1].ts, m.ts);
+                      final last = i == msgs.length - 1;
+                      final ups = last && !m.isUser && !m.failed && !store.busy && store.followUpsFor == store.current.id ? store.followUps : const <String>[];
+                      Widget item = bubble;
+                      if (newDay || ups.isNotEmpty) {
+                        item = Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                          if (newDay) _DaySeparator(m.ts),
+                          bubble,
+                          if (ups.isNotEmpty) _FollowUps(ups, onPick: _send),
+                        ]);
+                      }
                       // Only the newest bubbles slide in; older ones must not animate again while scrolling.
-                      return i >= msgs.length - 2 ? Appear(key: ValueKey(m.ts), dy: 10, child: bubble) : KeyedSubtree(key: ValueKey(m.ts), child: bubble);
+                      return i >= msgs.length - 2 ? Appear(key: ValueKey(m.ts), dy: 10, child: item) : KeyedSubtree(key: ValueKey(m.ts), child: item);
                     },
                   ),
                 ),
-        ),
+          )),
+          Positioned(
+            right: 16,
+            bottom: 8,
+            child: AnimatedScale(
+              scale: _away && msgs.isNotEmpty ? 1 : 0,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutBack,
+              child: Material(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                shape: const CircleBorder(),
+                elevation: 3,
+                child: IconButton(tooltip: 'Newest message', icon: const Icon(Icons.arrow_downward_rounded), onPressed: () => _toEnd()),
+              ),
+            ),
+          ),
+        ]),
       ),
       _statusPill(),
       _composer(store),
@@ -475,7 +550,7 @@ class _ChatViewState extends State<ChatView> {
                 maxLines: 6,
                 textCapitalization: TextCapitalization.sentences,
                 decoration: InputDecoration(
-                  hintText: _listening ? 'Listening…' : 'Ask AIy',
+                  hintText: _listening ? 'Listening…' : (prefs.liteMode ? 'Ask AIy (Lite mode)' : 'Ask AIy'),
                   filled: false,
                   border: InputBorder.none,
                   contentPadding: const EdgeInsets.symmetric(vertical: 12),
@@ -488,7 +563,7 @@ class _ChatViewState extends State<ChatView> {
               icon: Icon(Icons.tune_rounded, color: prefs.preferProvider.isEmpty ? s.onSurfaceVariant : s.primary),
               onSelected: prefs.setPreferProvider,
               itemBuilder: (_) => [
-                for (final e in const [('', 'Automatic (free ones first)'), ('gemini', 'Gemini first'), ('groq', 'Groq first'), ('openrouter', 'OpenRouter first')])
+                for (final e in [('', 'Automatic (free ones first)'), for (final id in AiEngine.chatProviders) if (context.read<AiEngine>().ready(id)) (id, '${AiEngine.names[id]} first')])
                   CheckedPopupMenuItem(value: e.$1, checked: prefs.preferProvider == e.$1, child: Text(e.$2)),
               ],
             ),
@@ -496,8 +571,9 @@ class _ChatViewState extends State<ChatView> {
               tooltip: prefs.liveSearch ? 'Live internet search is on' : 'Live internet search is off',
               icon: Icon(Icons.public_rounded, color: prefs.liveSearch ? s.primary : s.onSurfaceVariant),
               onPressed: () {
-                prefs.setLiveSearch(!prefs.liveSearch);
-                snack(context, prefs.liveSearch ? 'Live search off' : 'Live search on: answers can use Google Search (Gemini).');
+                final on = !prefs.liveSearch;
+                prefs.setLiveSearch(on);
+                snack(context, on ? 'Live search on: answers can use Google Search (Gemini).' : 'Live search off');
               },
             ),
             IconButton(tooltip: 'Speak', icon: Icon(_listening ? Icons.stop_circle_outlined : Icons.mic_none_rounded, color: _listening ? s.primary : null), onPressed: _mic),
@@ -506,13 +582,18 @@ class _ChatViewState extends State<ChatView> {
               child: AnimatedScale(
                 scale: canSend || store.busy ? 1 : 0.85,
                 duration: const Duration(milliseconds: 180),
-                child: store.busy
-                    ? IconButton.filled(tooltip: 'Stop', onPressed: store.stop, icon: const Icon(Icons.stop_rounded))
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 220),
+                  transitionBuilder: (c, a) => RotationTransition(turns: Tween(begin: 0.75, end: 1.0).animate(a), child: ScaleTransition(scale: a, child: c)),
+                  child: store.busy
+                    ? IconButton.filled(key: const ValueKey('stop'), tooltip: 'Stop', onPressed: store.stop, icon: const Icon(Icons.stop_rounded))
                     : IconButton.filled(
+                        key: const ValueKey('send'),
                         tooltip: 'Send',
                         onPressed: canSend ? _send : null,
                         icon: const Icon(Icons.arrow_upward_rounded),
                       ),
+                ),
               ),
             ),
           ]),
@@ -520,6 +601,84 @@ class _ChatViewState extends State<ChatView> {
       ),
     );
   }
+}
+
+bool _sameDay(int a, int b) {
+  final x = DateTime.fromMillisecondsSinceEpoch(a), y = DateTime.fromMillisecondsSinceEpoch(b);
+  return x.year == y.year && x.month == y.month && x.day == y.day;
+}
+
+/// "Today", "Yesterday" or a date between the messages of different days.
+class _DaySeparator extends StatelessWidget {
+  final int ts;
+  const _DaySeparator(this.ts);
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final now = DateTime.now();
+    final d = DateTime.fromMillisecondsSinceEpoch(ts);
+    final days = DateTime(now.year, now.month, now.day).difference(DateTime(d.year, d.month, d.day)).inDays;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final label = days <= 0 ? 'Today' : (days == 1 ? 'Yesterday' : '${d.day} ${months[d.month - 1]}${d.year == now.year ? '' : ' ${d.year}'}');
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          decoration: BoxDecoration(color: t.colorScheme.surfaceContainerHigh.withValues(alpha: 0.8), borderRadius: BorderRadius.circular(999)),
+          child: Text(label, style: t.textTheme.labelSmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
+        ),
+      ),
+    );
+  }
+}
+
+/// The suggested next questions under the newest answer.
+class _FollowUps extends StatelessWidget {
+  final List<String> items;
+  final ValueChanged<String> onPick;
+  const _FollowUps(this.items, {required this.onPick});
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final s = t.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        for (var i = 0; i < items.length; i++)
+          Appear(
+            delay: 150 + i * 90,
+            dy: 8,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Pressable(
+                onTap: () => onPick(items[i]),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: s.primary.withValues(alpha: 0.35)),
+                    color: s.primary.withValues(alpha: 0.06),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.subdirectory_arrow_right_rounded, size: 16, color: s.primary),
+                    const SizedBox(width: 8),
+                    Flexible(child: Text(items[i], style: t.textTheme.bodyMedium)),
+                  ]),
+                ),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+}
+
+/// "Good morning, Sara" (or without the name).
+String _greeting(String name) {
+  final h = DateTime.now().hour;
+  final part = h < 5 ? 'Good night' : (h < 12 ? 'Good morning' : (h < 17 ? 'Good afternoon' : 'Good evening'));
+  return name.isEmpty ? part : '$part, $name';
 }
 
 class _Welcome extends StatelessWidget {
@@ -543,7 +702,11 @@ class _Welcome extends StatelessWidget {
                 const SizedBox(height: 22),
                 Appear(
                   delay: 100,
-                  child: Text(name.isEmpty ? 'How can I help today?' : 'Hi $name,\nhow can I help?', textAlign: TextAlign.center, style: t.textTheme.headlineLarge?.copyWith(height: 1.15)),
+                  child: Column(children: [
+                    Text(_greeting(name), textAlign: TextAlign.center, style: t.textTheme.titleMedium?.copyWith(color: t.colorScheme.primary)),
+                    const SizedBox(height: 6),
+                    Text('How can I help?', textAlign: TextAlign.center, style: t.textTheme.headlineLarge?.copyWith(height: 1.15)),
+                  ]),
                 ),
               ]),
               Padding(
@@ -552,15 +715,29 @@ class _Welcome extends StatelessWidget {
                   for (var i = 0; i < _suggestions.length; i++)
                     Appear(
                       delay: 220 + i * 80,
-                      child: Pressable(
-                        onTap: () => onPick(_suggestions[i].$3),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 11),
-                          child: Row(children: [
-                            Icon(_suggestions[i].$1, size: 22, color: t.colorScheme.onSurfaceVariant),
-                            const SizedBox(width: 18),
-                            Expanded(child: Text(_suggestions[i].$2, style: t.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w400))),
-                          ]),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Pressable(
+                          onTap: () => onPick(_suggestions[i].$3),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                            decoration: BoxDecoration(
+                              color: t.colorScheme.surfaceContainerHigh.withValues(alpha: 0.7),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: t.colorScheme.outlineVariant.withValues(alpha: 0.35)),
+                            ),
+                            child: Row(children: [
+                              Container(
+                                width: 36,
+                                height: 36,
+                                decoration: BoxDecoration(color: t.colorScheme.primary.withValues(alpha: 0.14), shape: BoxShape.circle),
+                                child: Icon(_suggestions[i].$1, size: 19, color: t.colorScheme.primary),
+                              ),
+                              const SizedBox(width: 14),
+                              Expanded(child: Text(_suggestions[i].$2, style: t.textTheme.bodyLarge)),
+                              Icon(Icons.arrow_forward_rounded, size: 18, color: t.colorScheme.onSurfaceVariant.withValues(alpha: 0.6)),
+                            ]),
+                          ),
                         ),
                       ),
                     ),
@@ -602,7 +779,12 @@ class _UserBubble extends StatelessWidget {
         margin: const EdgeInsets.only(left: 48, top: 8, bottom: 8),
         padding: const EdgeInsets.all(6),
         decoration: BoxDecoration(
-          color: t.colorScheme.primary.withValues(alpha: 0.18),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [t.colorScheme.primary.withValues(alpha: 0.24), Color.lerp(t.colorScheme.primary, t.colorScheme.tertiary, 0.6)!.withValues(alpha: 0.16)],
+          ),
+          border: Border.all(color: t.colorScheme.primary.withValues(alpha: 0.18)),
           borderRadius: const BorderRadius.only(topLeft: Radius.circular(22), topRight: Radius.circular(22), bottomLeft: Radius.circular(22), bottomRight: Radius.circular(6)),
         ),
         child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [

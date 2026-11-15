@@ -1,14 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../logic/followups.dart';
 import 'ai.dart';
+import 'connectivity.dart';
 import 'error_center.dart';
+import 'native.dart';
 import 'net.dart';
 import 'prefs.dart';
+import 'store.dart';
+import 'app_log.dart';
 
 class Conversation {
   final String id;
@@ -17,16 +21,20 @@ class Conversation {
 
   /// The folder the person put this chat in ('' = none).
   String folder;
+
+  /// Pinned chats stay at the top of the list and are never removed to make room.
+  bool pinned;
   final List<ChatMsg> messages;
-  Conversation({required this.id, this.title = '', int? updated, this.folder = '', List<ChatMsg>? messages})
+  Conversation({required this.id, this.title = '', int? updated, this.folder = '', this.pinned = false, List<ChatMsg>? messages})
       : updated = updated ?? DateTime.now().millisecondsSinceEpoch,
         messages = messages ?? [];
 
-  Map<String, dynamic> toJson() => {'id': id, 't': title, 'u': updated, if (folder.isNotEmpty) 'fo': folder, 'm': [for (final m in messages) m.toJson()]};
+  Map<String, dynamic> toJson() => {'id': id, 't': title, 'u': updated, if (folder.isNotEmpty) 'fo': folder, if (pinned) 'pin': true, 'm': [for (final m in messages) m.toJson()]};
   factory Conversation.fromJson(Map<String, dynamic> j) => Conversation(
         id: '${j['id']}',
         title: '${j['t'] ?? ''}',
         folder: '${j['fo'] ?? ''}',
+        pinned: j['pin'] == true,
         updated: (j['u'] as num?)?.toInt(),
         messages: [
           for (final m in (j['m'] as List? ?? const []))
@@ -113,8 +121,8 @@ class ChatStore extends ChangeNotifier {
   Future<void> _load() async {
     try {
       final f = File('${(await _dir()).path}/chats.json');
-      if (f.existsSync()) {
-        final j = jsonDecode(await f.readAsString());
+      {
+        final j = await Store.readJson(f);
         if (j is List) {
           all
             ..clear()
@@ -125,20 +133,25 @@ class ChatStore extends ChangeNotifier {
         }
       }
     } catch (e) {
-      debugPrint('chats load: $e');
+      AppLog.i('chats load: $e');
     }
     notifyListeners();
+    _resumeWaiting();
   }
 
   Future<void> _save() async {
     try {
       all.sort((a, b) => b.updated.compareTo(a.updated));
+      // Too many chats: the oldest unpinned ones (never the open one) make room.
       while (all.length > 80) {
-        _deleteImages(all.removeLast());
+        final i = all.lastIndexWhere((c) => !c.pinned && !identical(c, current));
+        if (i < 0) break;
+        _deleteImages(all.removeAt(i));
       }
-      await File('${(await _dir()).path}/chats.json').writeAsString(jsonEncode([for (final c in all) c.toJson()]));
+      await Store.writeJson(File('${(await _dir()).path}/chats.json'), [for (final c in all) c.toJson()]);
     } catch (e) {
-      debugPrint('chats save: $e');
+      AppLog.i('chats save: $e');
+      Store.notices.value = [...Store.notices.value, fileErrorText(e, 'your chats')];
     }
   }
 
@@ -166,7 +179,60 @@ class ChatStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Pinned first, then newest first (what the side menu shows).
+  List<Conversation> get sorted => [...all.where((c) => c.pinned), ...all.where((c) => !c.pinned)];
+
+  Future<void> togglePin(Conversation c) async {
+    c.pinned = !c.pinned;
+    notifyListeners();
+    await _save();
+  }
+
+  Future<void> rename(Conversation c, String title) async {
+    final n = title.trim();
+    if (n.isEmpty) return;
+    c.title = n.length > 60 ? n.substring(0, 60) : n;
+    notifyListeners();
+    await _save();
+  }
+
+  /// Deleted but not yet thrown away, so "Undo" can bring it back for a few seconds.
+  Conversation? _trash;
+  Timer? _trashTimer;
+
+  /// Removes the chat from the list; its pictures are deleted only when Undo is no longer possible.
+  /// Returns false (and does nothing) for the chat that is being answered right now.
+  bool softDelete(Conversation c) {
+    if (busy && identical(current, c)) return false;
+    _purgeTrash();
+    all.remove(c);
+    _trash = c;
+    if (identical(current, c)) current = Conversation(id: _newId());
+    _trashTimer = Timer(const Duration(seconds: 6), _purgeTrash);
+    notifyListeners();
+    unawaited(_save());
+    return true;
+  }
+
+  void undoDelete() {
+    final c = _trash;
+    if (c == null) return;
+    _trashTimer?.cancel();
+    _trash = null;
+    all.add(c);
+    notifyListeners();
+    unawaited(_save());
+  }
+
+  void _purgeTrash() {
+    _trashTimer?.cancel();
+    final c = _trash;
+    _trash = null;
+    if (c != null) _deleteImages(c);
+  }
+
   Future<void> delete(Conversation c) async {
+    if (busy && identical(current, c)) return;
     all.remove(c);
     _deleteImages(c);
     if (identical(current, c)) current = Conversation(id: _newId());
@@ -175,6 +241,8 @@ class ChatStore extends ChangeNotifier {
   }
 
   Future<void> deleteAll() async {
+    if (busy) stop();
+    _purgeTrash();
     for (final c in all) {
       _deleteImages(c);
     }
@@ -192,6 +260,19 @@ class ChatStore extends ChangeNotifier {
     final ext = low.endsWith('.pdf') ? 'pdf' : (low.endsWith('.png') ? 'png' : (low.endsWith('.webp') ? 'webp' : 'jpg'));
     final out = '${d.path}/${_newId()}.$ext';
     await File(pickedPath).copy(out);
+    // A photo that is big, or any photo in Lite mode, is made smaller first: far fewer bytes to send over a slow line.
+    if (ext != 'pdf') {
+      final lite = prefs.liteMode;
+      if (lite || await File(out).length() > 1500 * 1024) {
+        final small = await Native.shrinkImage(out, maxSide: lite ? 1024 : 1600, quality: lite ? 62 : 80);
+        if (small != null) {
+          try {
+            File(out).deleteSync();
+          } catch (_) {}
+          return small;
+        }
+      }
+    }
     return out;
   }
 
@@ -256,7 +337,45 @@ class ChatStore extends ChangeNotifier {
     await _answer(c, avoid: avoid);
   }
 
+  static String _short(Conversation c) => c.title.isEmpty ? 'new chat' : (c.title.length > 28 ? '${c.title.substring(0, 28)}…' : c.title);
+
+  /// The person cancelled the waiting request: the message becomes an ordinary failed answer.
+  void _giveUp(Conversation c) {
+    if (c.messages.isEmpty) return;
+    final m = c.messages.last;
+    if (m.failed && m.note == 'waiting') {
+      m.note = '';
+      m.text = 'Stopped waiting for the internet. Tap Try again when you are online.';
+      notifyListeners();
+      _save();
+    }
+  }
+
+  /// After a restart: chats that were waiting for the internet are put back on the waiting list.
+  void _resumeWaiting() {
+    for (final c in all) {
+      if (c.messages.isEmpty) continue;
+      final m = c.messages.last;
+      if (m.failed && m.note == 'waiting') {
+        Offline.restore(title: 'Chat: ${_short(c)}', run: () => _resendChat(c), onCancel: () => _giveUp(c));
+      }
+    }
+  }
+
+  /// Asks again for a chat whose last answer failed for lack of internet (only when nothing changed meanwhile).
+  Future<void> _resendChat(Conversation c) async {
+    if (busy || c.messages.isEmpty || !c.messages.last.failed || !all.contains(c)) return;
+    c.messages.removeLast();
+    if (c.messages.isEmpty) return;
+    await _answer(c);
+  }
+
+  /// Suggested next questions for the newest answer of chat [followUpsFor] (kept in memory only).
+  List<String> followUps = const [];
+  String followUpsFor = '';
+
   Future<void> _answer(Conversation c, {({String pid, String model})? avoid}) async {
+    followUps = const [];
     busy = true;
     streamText = '';
     final cancel = _cancel = AiCancel();
@@ -269,10 +388,11 @@ class ChatStore extends ChangeNotifier {
         search: prefs.liveSearch,
         prefer: prefs.preferProvider,
         instructions: prefs.customInstructions,
+        followUps: prefs.followUps,
         avoid: avoid,
         cancel: cancel,
         onText: (t) {
-          streamText = t;
+          streamText = hideFollowUpTail(t);
           final now = DateTime.now();
           // Repainting the whole answer for every word would make the phone stutter.
           if (t.isEmpty || now.difference(lastPaint).inMilliseconds >= 70) {
@@ -284,11 +404,20 @@ class ChatStore extends ChangeNotifier {
       if (r.stopped && r.text.isEmpty) {
         c.messages.add(ChatMsg(role: 'model', text: 'Stopped before an answer arrived.', failed: true));
       } else {
-        c.messages.add(ChatMsg(role: 'model', text: r.text, provider: r.provider, model: r.model, sources: r.sources, note: r.stopped ? 'You stopped this answer.' : r.note));
+        final split = splitFollowUps(r.text);
+        followUps = r.stopped ? const [] : split.questions;
+        followUpsFor = c.id;
+        c.messages.add(ChatMsg(role: 'model', text: split.text, provider: r.provider, model: r.model, sources: r.sources, note: r.stopped ? 'You stopped this answer.' : r.note));
       }
     } on ApiError catch (e) {
-      c.messages.add(ChatMsg(role: 'model', text: e.message, failed: true));
-      ErrorCenter.report(e, where: 'Chat', retry: retry);
+      if (Offline.hold(e, title: 'Chat: ${_short(c)}', run: () => _resendChat(c), onCancel: () => _giveUp(c))) {
+        // The message stays; the answer is asked for again by itself when the internet is back (also after a restart:
+        // the note 'waiting' is saved with the chat).
+        c.messages.add(ChatMsg(role: 'model', text: 'No internet. AIy will ask again by itself when the connection is back.', failed: true, note: 'waiting'));
+      } else {
+        c.messages.add(ChatMsg(role: 'model', text: e.message, failed: true));
+        ErrorCenter.report(e, where: 'Chat', retry: retry);
+      }
     } catch (e) {
       c.messages.add(ChatMsg(role: 'model', text: 'Something went wrong: $e', failed: true));
     }

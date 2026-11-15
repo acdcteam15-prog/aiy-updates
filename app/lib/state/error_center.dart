@@ -25,13 +25,19 @@ class AiProblem {
 
   /// The OpenRouter model that was used (to mark it in the picker).
   final String modelId;
-  const AiProblem({required this.error, required this.whole, this.where = '', this.retry, this.retryWith, this.costOf, this.modelId = ''});
+
+  /// True when the failure came from OpenRouter (the original pop-up); false for any other failure of a job.
+  final bool openRouter;
+  const AiProblem({required this.error, required this.whole, this.where = '', this.retry, this.retryWith, this.costOf, this.modelId = '', this.openRouter = true});
 }
 
 /// Where OpenRouter errors are shown to the person as a pop-up. The screens set [presenter]; the state classes call [report].
 class ErrorCenter {
   static final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
   static Future<void> Function(AiProblem p)? presenter;
+
+  /// Opens a new chat that asks AIy to explain an error (set by the home screen).
+  static void Function(String question)? askAi;
 
   static String _lastKey = '';
   static int _lastAt = 0;
@@ -44,17 +50,31 @@ class ErrorCenter {
     Future<void> Function(OrModel m)? retryWith,
     ({double cost, double worst}) Function(OrModel m)? costOf,
     String modelId = '',
+    bool general = false,
   }) {
-    if (e is! ApiError) return false;
-    final part = e.openRouterPart;
-    if (part == null || presenter == null) return false;
+    if (presenter == null) return false;
+    final part = e is ApiError ? e.openRouterPart : null;
+    if (part == null) {
+      // Any other failure: a card with Retry / Ask AIy / Copy report, for unexpected errors and service errors.
+      // Plain checks ("this zip is empty") stay as text on the screen only.
+      if (!general) return false;
+      if (e is ApiError && (e.status == null || e.isConnection)) return false;
+      final ae = e is ApiError ? e : ApiError('$e');
+      final key = 'g|$where|${ae.message}';
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (key == _lastKey && now - _lastAt < 4000) return true;
+      _lastKey = key;
+      _lastAt = now;
+      presenter!(AiProblem(error: ae, whole: ae, where: where, retry: retry, retryWith: retryWith, costOf: costOf, modelId: modelId, openRouter: false));
+      return true;
+    }
     // The same failure reported by two layers in a row opens one pop-up, not two.
     final key = '${part.status}|${part.model}|${part.message}';
     final now = DateTime.now().millisecondsSinceEpoch;
     if (key == _lastKey && now - _lastAt < 4000) return true;
     _lastKey = key;
     _lastAt = now;
-    presenter!(AiProblem(error: part, whole: e, where: where, retry: retry, retryWith: retryWith, costOf: costOf, modelId: modelId));
+    presenter!(AiProblem(error: part, whole: e as ApiError, where: where, retry: retry, retryWith: retryWith, costOf: costOf, modelId: modelId));
     return true;
   }
 }

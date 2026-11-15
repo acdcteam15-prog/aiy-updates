@@ -13,7 +13,7 @@ import '../../state/updater.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
 import '../widgets/fx.dart';
-import '../widgets/markdown.dart';
+import '../widgets/job_stepper.dart';
 import '../../state/app_builder.dart';
 import '../../state/backup.dart';
 import '../../state/code_state.dart';
@@ -25,6 +25,12 @@ import 'connect_screen.dart';
 import 'diagnostics_screen.dart';
 import 'lock_screen.dart';
 import 'log_screen.dart';
+import '../../state/app_log.dart';
+import '../../state/store.dart';
+import '../widgets/health_sheet.dart';
+import 'storage_screen.dart';
+import 'jobs_screen.dart';
+import 'update_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -37,11 +43,24 @@ class SettingsScreen extends StatelessWidget {
     final engine = Provider.of<AiEngine>(context, listen: false);
     final user = FirebaseAuth.instance.currentUser;
     final sub = t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant);
-    Widget head(String s) => Padding(padding: const EdgeInsets.fromLTRB(6, 22, 6, 8), child: Text(s, style: t.textTheme.titleSmall?.copyWith(color: t.colorScheme.primary)));
+    const icons = <String, IconData>{'Look': Icons.palette_outlined, 'Simple or Advanced': Icons.tune_rounded, 'Chat': Icons.chat_bubble_outline_rounded, 'Standing instructions': Icons.record_voice_over_outlined, 'Coding': Icons.code_rounded, 'Used today': Icons.insights_rounded, 'Slow connection': Icons.network_check_rounded, 'Spending': Icons.savings_outlined, 'Security and backup': Icons.shield_outlined, 'Help': Icons.help_outline_rounded, 'About': Icons.info_outline_rounded, 'Data on this phone': Icons.storage_rounded};
+    Widget head(String s) => Padding(
+          padding: const EdgeInsets.fromLTRB(6, 24, 6, 8),
+          child: Row(children: [
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(color: t.colorScheme.primary.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(9)),
+              child: Icon(icons[s] ?? Icons.circle_outlined, size: 16, color: t.colorScheme.primary),
+            ),
+            const SizedBox(width: 10),
+            Text(s, style: t.textTheme.titleSmall?.copyWith(color: t.colorScheme.primary)),
+          ]),
+        );
     final connected = KeyVault.ids.where(keys.has).length;
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
-      body: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 40), children: [
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 40), children: _stagger([
         // ---- account
         StepCard(
           padding: const EdgeInsets.all(6),
@@ -132,13 +151,22 @@ class SettingsScreen extends StatelessWidget {
         head('Chat'),
         StepCard(
           padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
-          child: SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Live internet search'),
-            subtitle: const Text('Answers can use Google Search. Works when Gemini answers.'),
-            value: p.liveSearch,
-            onChanged: p.setLiveSearch,
-          ),
+          child: Column(children: [
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Live internet search'),
+              subtitle: const Text('Answers can use Google Search. Works when Gemini answers.'),
+              value: p.liveSearch,
+              onChanged: p.setLiveSearch,
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Suggest follow-up questions'),
+              subtitle: const Text('Tappable next questions under each answer.'),
+              value: p.followUps,
+              onChanged: p.setFollowUps,
+            ),
+          ]),
         ),
         head('Standing instructions'),
         const _Instructions(),
@@ -155,6 +183,10 @@ class SettingsScreen extends StatelessWidget {
               'Free models always cost nothing. Paid models need credit in your OpenRouter account.',
               style: sub,
             ),
+            const SizedBox(height: 14),
+            _BudgetSlider(label: 'Daily limit', value: p.dayCapUsd, max: 20, onChanged: p.setDayCapUsd),
+            _BudgetSlider(label: 'Monthly limit', value: p.monthCapUsd, max: 100, onChanged: p.setMonthCapUsd),
+            Text('Paid requests that could go over these totals are refused before they start (the price check counts the most a request can cost). Off = no limit.', style: sub),
           ]),
         ),
 
@@ -162,21 +194,32 @@ class SettingsScreen extends StatelessWidget {
         head('Used today'),
         StepCard(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            for (final id in const ['gemini', 'groq', 'openrouter'])
+            for (final id in AiEngine.chatProviders)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Row(children: [
                   Expanded(child: Text(AiEngine.names[id]!)),
-                  Text(keys.has(id) ? '${p.usage(id)} request(s)' : 'not connected', style: sub),
+                  Text(engine.ready(id) ? '${p.usage(id)} request(s)' : 'not connected', style: sub),
                 ]),
               ),
             const SizedBox(height: 6),
-            Text('When a free daily limit is reached, AIy moves to the next model and service by itself: Gemini, then Groq, then OpenRouter\'s free models.', style: sub),
+            Text('When a free daily limit is reached, AIy moves to the next model and service by itself: Gemini, Groq, Mistral, Cerebras, NVIDIA, Cloudflare, then OpenRouter\'s free models (whichever you connected).', style: sub),
             const SizedBox(height: 6),
-            if (p.advanced) Text('Models in use: ${[for (final id in const ['gemini', 'groq', 'openrouter']) if (keys.has(id)) engine.modelsFor(id).take(2).join(', ')].join(' · ')}', style: sub),
+            if (p.advanced) Text('Models in use: ${[for (final id in AiEngine.chatProviders) if (engine.ready(id)) engine.modelsFor(id).take(2).join(', ')].join(' · ')}', style: sub),
           ]),
         ),
 
+        head('Slow connection'),
+        StepCard(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 6),
+          child: SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Lite mode'),
+            subtitle: const Text('Sends less data over a slow line: smaller photos, only the latest messages, no live search, shorter answers. AIy offers it by itself when requests keep timing out.'),
+            value: p.liteMode,
+            onChanged: p.setLiteMode,
+          ),
+        ),
         head('Spending'),
         const _SpendCard(),
         head('Security and backup'),
@@ -187,6 +230,9 @@ class SettingsScreen extends StatelessWidget {
           child: Column(children: [
             ListTile(leading: const Icon(Icons.health_and_safety_outlined), title: const Text('Test everything'), subtitle: const Text('Checks your keys, GitHub and the phone parts, and says what is wrong'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const DiagnosticsScreen()))),
             ListTile(leading: const Icon(Icons.slideshow_rounded), title: const Text('Show the welcome tour again'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const TourScreen(replay: true)))),
+            ListTile(leading: const Icon(Icons.pending_actions_outlined), title: const Text('Running and waiting'), subtitle: const Text('Everything AIy is doing or waiting to do'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const JobsScreen()))),
+            ListTile(leading: const Icon(Icons.sd_storage_outlined), title: const Text('Storage'), subtitle: const Text('What AIy keeps on the phone, and cleanup'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const StorageScreen()))),
+            ListTile(leading: const Icon(Icons.monitor_heart_outlined), title: const Text('AI services health'), subtitle: const Text('Which services answered well lately'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => showHealthSheet(context)),
             ListTile(leading: const Icon(Icons.receipt_long_outlined), title: const Text('Log'), subtitle: const Text('The last things AIy did, with keys removed'), trailing: const Icon(Icons.chevron_right_rounded), onTap: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const LogScreen()))),
           ]),
         ),
@@ -205,6 +251,7 @@ class SettingsScreen extends StatelessWidget {
               title: const Text('Delete all chats'),
               onTap: () async {
                 if (await confirmDialog(context, 'Delete all chats?', body: 'This cannot be undone.', yes: 'Delete')) {
+                  if (!context.mounted) return;
                   await context.read<ChatStore>().deleteAll();
                   if (context.mounted) snack(context, 'All chats deleted.');
                 }
@@ -235,9 +282,12 @@ class SettingsScreen extends StatelessWidget {
             ),
           ]),
         ),
-      ]),
+      ])),
     );
   }
+
+  /// The first parts of the page slide in one after another.
+  static List<Widget> _stagger(List<Widget> l) => [for (var i = 0; i < l.length; i++) i < 14 ? Appear(delay: i * 35, dy: 12, child: l[i]) : l[i]];
 }
 
 /// Version, "Check for updates" and the in-app update (downloaded, checked, then handed to Android).
@@ -269,7 +319,11 @@ class _UpdateCardState extends State<_UpdateCard> {
       case UpdateStatus.checking:
         state = 'Checking…';
       case UpdateStatus.downloading:
-        state = 'Downloading… ${(u.progress * 100).round()}%';
+        state = 'Downloading ${latest?.versionName ?? ''}… ${(u.progress * 100).round()}%';
+      case UpdateStatus.paused:
+        state = 'Download paused at ${(u.progress * 100).round()}%.';
+      case UpdateStatus.ready:
+        state = 'Version ${latest!.versionName} is downloaded and ready to install.';
       case UpdateStatus.installing:
         state = 'Opening the installer…';
       case UpdateStatus.error:
@@ -289,17 +343,25 @@ class _UpdateCardState extends State<_UpdateCard> {
             ]),
           ),
         ]),
-        if (u.status == UpdateStatus.downloading) Padding(padding: const EdgeInsets.only(top: 12), child: LinearProgressIndicator(value: u.progress == 0 ? null : u.progress, borderRadius: BorderRadius.circular(8))),
-        if (u.needsPermission)
-          Padding(padding: const EdgeInsets.only(top: 10), child: Text('Android needs your permission once: switch on "Allow from this source" for AIy, come back, and tap Update again.', style: sub?.copyWith(color: t.colorScheme.error))),
-        if (u.hasUpdate && latest!.notes.isNotEmpty) ...[const SizedBox(height: 10), MdText(latest.notes)],
+        if (u.status == UpdateStatus.downloading) Padding(padding: const EdgeInsets.only(top: 12), child: ShineBar(value: u.total > 0 ? u.progress : null)),
         const SizedBox(height: 10),
         Row(children: [
           if (u.hasUpdate)
-            FilledButton(style: FilledButton.styleFrom(minimumSize: const Size(64, 44)), onPressed: u.busy ? null : u.downloadAndInstall, child: const Text('Update'))
+            FilledButton(
+              style: FilledButton.styleFrom(minimumSize: const Size(64, 44)),
+              onPressed: () => Navigator.push(context, MaterialPageRoute<void>(builder: (_) => const UpdateScreen())),
+              child: Text(u.status == UpdateStatus.ready ? 'Install…' : "What's new and update…"),
+            )
           else
             OutlinedButton(onPressed: u.busy ? null : () => u.check(), child: const Text('Check for updates')),
         ]),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Download updates in the background'),
+          subtitle: const Text('By itself, on Wi-Fi only. It keeps going when you leave AIy and continues if AIy is closed.'),
+          value: p.autoDownloadUpdate,
+          onChanged: p.setAutoDownloadUpdate,
+        ),
         SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Check automatically'), value: p.autoUpdateCheck, onChanged: p.setAutoUpdateCheck),
       ]),
     );
@@ -453,14 +515,19 @@ class _SecurityCardState extends State<_SecurityCard> {
       if (f == null || !mounted) return;
       if (!await confirmDialog(context, 'Restore this backup?', body: 'Chats, app ideas, history and settings in the backup replace the ones with the same name on this phone. Your keys are not touched.', yes: 'Restore')) return;
       setState(() => _busy = true);
-      final n = await BackupService.restore(f.path, prefs);
-      await chat.reload();
-      await code.reload();
-      await builder.reload();
-      await spend.load();
-      if (mounted) snack(context, 'Restored $n file(s).');
+      try {
+        final n = await BackupService.restore(f.path, prefs);
+        await chat.reload();
+        await code.reload();
+        await builder.reload();
+        await spend.load();
+        if (mounted) snack(context, 'Restored $n file(s). Your previous files were kept in a pre-restore folder.');
+      } finally {
+        Store.frozen = false;
+      }
     } catch (e) {
-      if (mounted) snack(context, 'Restore failed: ${e is ApiError ? e.message : e}');
+      AppLog.i('restore failed: $e');
+      if (mounted) snack(context, 'Restore failed: ${e is ApiError ? e.message : fileErrorText(e, 'the backup')}');
     }
     if (mounted) setState(() => _busy = false);
   }
@@ -516,5 +583,27 @@ class _SecurityCardState extends State<_SecurityCard> {
         ]),
       ]),
     );
+  }
+}
+
+
+/// A money limit where the far left means "off".
+class _BudgetSlider extends StatelessWidget {
+  final String label;
+  final double value;
+  final double max;
+  final Future<void> Function(double) onChanged;
+  const _BudgetSlider({required this.label, required this.value, required this.max, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text(label, style: t.textTheme.titleSmall)),
+        Text(value <= 0 ? 'Off' : '\$${value.toStringAsFixed(2)}', style: t.textTheme.titleMedium?.copyWith(color: t.colorScheme.primary)),
+      ]),
+      Slider(value: value.clamp(0, max), min: 0, max: max, divisions: (max * 2).round(), onChanged: (v) => onChanged((v * 2).round() / 2)),
+    ]);
   }
 }

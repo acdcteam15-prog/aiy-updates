@@ -54,3 +54,24 @@ List<Problem> parseProblems(List<String> raw) {
   final sorted = [...out]..sort((a, b) => rank(a).compareTo(rank(b)));
   return sorted;
 }
+
+/// A build failure that comes from the build's own setup (Android/Gradle versions, a plugin's requirements), not from
+/// the project's code. Asking a model to "fix the code" cannot help and only costs money.
+/// Returns a plain-language description of what failed, or '' when it looks like a normal code error.
+String environmentFailure(String text) {
+  final t = text;
+  final aar = RegExp(r"task ':([\w.\-]+):(?:check(?:Debug|Release)AarMetadata|check\w*AarMetadata)'").firstMatch(t) ??
+      RegExp(r"(?:^|\s)([\w\-]+):check(?:Debug|Release)AarMetadata\b").firstMatch(t);
+  if (aar != null) return 'the plugin "${aar.group(1)}" needs a newer Android version than the build uses';
+  if (RegExp(r'requires libraries and applications that depend on it to compile against version \d+', caseSensitive: false).hasMatch(t) ||
+      t.contains('AAR metadata')) {
+    return 'a plugin needs a newer Android version than the build uses';
+  }
+  final jdk = RegExp(r'Unsupported class file major version|Android Gradle plugin requires Java \d+|requires Java \d+ to run').firstMatch(t);
+  if (jdk != null) return 'the Java version used by the build does not match Gradle or Android';
+  if (RegExp(r"Execution failed for task ':[\w.\-]+:(?:processDebugManifest|processReleaseManifest|mergeDebugNativeLibs|mergeReleaseNativeLibs|checkDebugDuplicateClasses|checkReleaseDuplicateClasses)'").hasMatch(t) &&
+      !RegExp(r'^e: ', multiLine: true).hasMatch(t)) {
+    return 'two parts of the app or its plugins clash (dependency problem)';
+  }
+  return '';
+}

@@ -1,15 +1,16 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../logic/fixcontext.dart';
 import '../logic/buildlog.dart';
 import '../logic/patcher.dart';
 import '../logic/project.dart';
 import 'ai.dart';
 import 'app_log.dart';
+import 'connectivity.dart';
 import 'error_center.dart';
 import 'github.dart';
 import 'keys.dart';
@@ -17,6 +18,8 @@ import 'native.dart';
 import 'net.dart';
 import 'prefs.dart';
 import 'spend.dart';
+import 'store.dart';
+import 'paid_jobs.dart';
 
 /// One file touched by a patch.
 class FileChange {
@@ -32,6 +35,12 @@ class FileChange {
   /// A structure problem found after the change (unbalanced bracket, broken JSON...).
   String? problem;
   FileChange(this.path, this.before, this.after);
+
+  /// What the model wrote (kept so changes that were turned off can be turned on again).
+  String? written;
+
+  /// Changed parts the person turned off in the review (numbers of [diffHunks]).
+  Set<int> rejected = {};
 
   bool get isNew => before == null;
   bool get changed => before != after;
@@ -158,18 +167,51 @@ class CodeState extends ChangeNotifier {
   int get warnings => changes.where((c) => !c.ok).length;
 
   void _busy(String label) {
+    heldOffline = false;
     busy = label;
     error = null;
     notifyListeners();
   }
 
-  void _fail(Object e, {String where = '', Future<void> Function()? retry, Future<void> Function(OrModel m)? retryWith, String modelId = ''}) {
+  /// True while the last job is waiting for the internet (the auto-fix loop pauses on this).
+  bool heldOffline = false;
+
+  /// Title under which the last job waits for the internet ('' when none).
+  String heldTitle = '';
+
+  void _fail(Object e, {String where = '', Future<void> Function()? retry, Future<void> Function(OrModel m)? retryWith, String modelId = '', PaidJob? paid}) {
+    // No internet: the job waits and is sent again by itself when the connection is back.
+    // A paid job is also written to the phone, so after a restart AIy can ask (with the price) whether to continue.
+    if (retry != null &&
+        where.isNotEmpty &&
+        Offline.hold(e, title: where, run: () async {
+          heldOffline = false;
+          heldTitle = '';
+          if (paid != null) {
+            // A paid job never restarts by itself: the person sees the price again and decides.
+            await PaidJobs.instance.askNow(paid.id);
+            return;
+          }
+          await retry();
+        }, onCancel: () {
+          heldOffline = false;
+          heldTitle = '';
+          if (paid != null) unawaited(PaidJobs.instance.done(paid.id));
+        })) {
+      heldOffline = true;
+      heldTitle = where;
+      if (paid != null) unawaited(PaidJobs.instance.hold(paid));
+      busy = '';
+      error = 'No internet. "$where" will be sent again by itself when the connection is back.';
+      notifyListeners();
+      return;
+    }
     busy = '';
     error = e is ApiError ? e.message : '$e';
     AppLog.i('code: $error');
     notifyListeners();
     // An OpenRouter problem also opens a pop-up, so it is seen at once wherever the person is looking.
-    ErrorCenter.report(e, where: where, retry: retry, retryWith: retryWith, modelId: modelId, costOf: (m) {
+    ErrorCenter.report(e, where: where, retry: retry, retryWith: retryWith, modelId: modelId, general: true, costOf: (m) {
       final est = estimate(m);
       return (cost: est.cost, worst: est.worstCase);
     });
@@ -330,7 +372,7 @@ class CodeState extends ChangeNotifier {
     try {
       _busy('Reading the project map…');
       explainLive = '';
-      final readmeKey = texts.keys.firstWhere((k) => k.toLowerCase() == 'readme.md', orElse: () => '');
+      final readmeKey = texts.keys.firstWhere((k) => RegExp(r'^readme(\.(md|txt|rst|markdown))?$', caseSensitive: false).hasMatch(k), orElse: () => '');
       var readme = readmeKey.isEmpty ? '' : texts[readmeKey]!;
       if (readme.length > 4000) readme = readme.substring(0, 4000);
       final r = await engine.ask(
@@ -473,6 +515,7 @@ class CodeState extends ChangeNotifier {
       }
     }
     final worst = m.free ? 0.0 : inTok * m.promptPrice + maxTokens * m.completionPrice;
+    if (!m.free && blocked == null) blocked = spend?.budgetBlock(worst, dayCap: prefs.dayCapUsd, monthCap: prefs.monthCapUsd);
     return CostEstimate(inTok, outTok, m.free ? 0 : cost, worst, maxTokens, blocked);
   }
 
@@ -507,7 +550,10 @@ class CodeState extends ChangeNotifier {
     try {
       _busy('${m.name} is writing the patch…');
       final user = _userPrompt();
-      var r = await engine.openRouter(m.id, _system, user, maxTokens: est.maxTokens, onText: (t) {
+      var r = await engine.openRouter(m.id, _system, user, maxTokens: est.maxTokens, track: !m.free, onRetry: (n) {
+        busy = '${m.name}: $n';
+        notifyListeners();
+      }, onText: (t) {
         if (t.isEmpty) return;
         busy = '${m.name} is writing the patch… ${'\n'.allMatches(t).length} lines so far';
         _liveNotify();
@@ -541,7 +587,10 @@ class CodeState extends ChangeNotifier {
         }
         sb.writeln('Send corrected SEARCH/REPLACE blocks for these files only, in the same format. Copy the SEARCH parts from the files as shown above.');
         try {
-          r = await engine.openRouter(m.id, _system, sb.toString(), maxTokens: est.maxTokens);
+          r = await engine.openRouter(m.id, _system, sb.toString(), maxTokens: est.maxTokens, track: !m.free, onRetry: (n) {
+            busy = '${m.name}: $n';
+            notifyListeners();
+          });
           cost += r.inTokens * m.promptPrice + r.outTokens * m.completionPrice;
           final fix = parsePatch(r.text);
           for (final e in fix.edits) {
@@ -587,7 +636,7 @@ class CodeState extends ChangeNotifier {
       busy = '';
       notifyListeners();
     } catch (e) {
-      _fail(e is ApiError ? e : ApiError('Something went wrong: ${_msg(e)}'), where: 'Writing the patch with ${m.name}', retry: () => patch(m), retryWith: patch, modelId: m.id);
+      _fail(e is ApiError ? e : ApiError('Something went wrong: ${_msg(e)}'), where: 'Writing the patch with ${m.name}', retry: () => patch(m), retryWith: patch, modelId: m.id, paid: m.free ? null : _paidJob(m, est));
     }
   }
 
@@ -654,8 +703,15 @@ class CodeState extends ChangeNotifier {
       });
       asks.add((q.trim(), r2.text, '${r2.provider} · ${r2.model}'));
     } catch (e) {
-      asks.add((q.trim(), 'Could not answer: ${e is ApiError ? e.message : e}', ''));
-      ErrorCenter.report(e, where: 'Asking about the project', retry: () => askAbout(q));
+      if (Offline.hold(e, title: 'Question: ${q.length > 30 ? '${q.substring(0, 30)}…' : q}', run: () async {
+        if (asks.isNotEmpty && asks.last.$1 == q.trim() && asks.last.$3.isEmpty) asks.removeLast();
+        await askAbout(q);
+      })) {
+        asks.add((q.trim(), 'No internet. AIy will answer when the connection is back.', ''));
+      } else {
+        asks.add((q.trim(), 'Could not answer: ${e is ApiError ? e.message : e}', ''));
+        ErrorCenter.report(e, where: 'Asking about the project', retry: () => askAbout(q));
+      }
     }
     askLive = '';
     asking = false;
@@ -681,8 +737,12 @@ class CodeState extends ChangeNotifier {
       );
       shotNote = r.text.trim();
     } catch (e) {
-      shotPath = '';
-      error = e is ApiError ? e.message : 'Could not read the photo: $e';
+      if (Offline.hold(e, title: 'Reading the photo', run: () => attachShot(path))) {
+        error = 'No internet. The photo will be read when the connection is back.';
+      } else {
+        shotPath = '';
+        error = e is ApiError ? e.message : 'Could not read the photo: $e';
+      }
     }
     shotBusy = false;
     notifyListeners();
@@ -691,6 +751,79 @@ class CodeState extends ChangeNotifier {
   void removeShot() {
     shotPath = shotNote = '';
     notifyListeners();
+  }
+
+  PaidJob _paidJob(OrModel m, CostEstimate est) => PaidJob(
+        id: 'code',
+        kind: 'code',
+        title: 'Code: ${request.length > 60 ? '${request.substring(0, 60)}…' : request} ($sourceName)',
+        modelId: m.id,
+        modelName: m.name,
+        cost: est.cost,
+        worst: est.worstCase,
+        data: {'zip': zipPath, 'name': sourceName, 'repo': repo, 'branch': branch, 'request': request, 'targets': targets, 'shot': shotNote, 'applied': applied},
+      );
+
+  /// Continues a paid patch that was waiting when AIy was closed (only after the person said yes, with the price shown).
+  Future<void> resumePaid(PaidJob j) async {
+    if (isBusy) return;
+    await PaidJobs.instance.done(j.id);
+    final d = j.data;
+    try {
+      final zip = '${d['zip'] ?? ''}';
+      final repoFull = '${d['repo'] ?? ''}';
+      final br = '${d['branch'] ?? ''}';
+      if (zip.isNotEmpty && File(zip).existsSync()) {
+        await _open(zip, '${d['name'] ?? ''}', repoFull, br);
+      } else if (repoFull.isNotEmpty && keys.has('github')) {
+        await loadGitHub(repoFull, br);
+        if (!hasSource) return; // loadGitHub showed its own error
+      } else {
+        throw ApiError('The project of this job is no longer on the phone. Open it again in the Code tab and write the request again (nothing was charged).');
+      }
+      final ap = d['applied'];
+      if (ap is Map) restoreApplied({for (final e in ap.entries) '${e.key}': '${e.value}'});
+      request = '${d['request'] ?? ''}';
+      shotNote = '${d['shot'] ?? ''}';
+      targets = [for (final t in (d['targets'] as List? ?? const [])) '$t'].where(texts.containsKey).toList();
+      if (targets.isEmpty) throw ApiError('The files of this job are not in the project any more. Write the request again.');
+      _busy('Finding ${j.modelName}…');
+      final models = await engine.orModels();
+      final m = models.where((x) => x.id == j.modelId).firstOrNull;
+      if (m == null) throw ApiError('The model ${j.modelName} is no longer offered by OpenRouter. Pick another model and tap "Write the change".');
+      busy = '';
+      await patch(m);
+    } catch (e) {
+      _fail(e is ApiError ? e : ApiError('Could not continue the job: ${_msg(e)}'));
+    }
+  }
+
+  /// The person turned changed parts of a file on or off in the review. The file, its check, and the zip follow.
+  Future<void> reviewChange(FileChange c, Set<int> rejected) async {
+    if (isBusy) return;
+    c.written ??= c.after;
+    final full = c.written!;
+    final d = diffLines(c.before ?? '', full);
+    c.rejected = {...rejected};
+    c.after = mergeHunks(d, c.rejected, crlf: full.contains('\r\n'));
+    c.problem = validateChange(c.path, c.before, c.after);
+    // A new list: anything already pushed is no longer the same change, so Publish offers to push again.
+    changes = [...changes];
+    notifyListeners();
+    await _rebuildOut();
+  }
+
+  /// Writes the result zip again from the current (reviewed) changes.
+  Future<void> _rebuildOut() async {
+    if (outZip.isEmpty || zipPath.isEmpty) return;
+    try {
+      _busy('Updating the zip…');
+      await Native.zipRebuild(zipPath, outZip, {for (final e in applied.entries) '$_root${e.key}': e.value, for (final c in changes.where((c) => c.changed)) '$_root${c.path}': c.after});
+      busy = '';
+      notifyListeners();
+    } catch (e) {
+      _fail(e is ApiError ? e : ApiError('The zip could not be updated: ${_msg(e)}'));
+    }
   }
 
   void restoreApplied(Map<String, String> snapshot) {
@@ -720,35 +853,48 @@ class CodeState extends ChangeNotifier {
 
   /// Prepares a repair round after a failed build: picks the files the errors point to, then the person
   /// confirms the model and the cost as usual. Returns a message when it cannot.
+  /// What the previous repair round tried, so the next one does not repeat it.
+  static const _fixPrefix = 'Fix the build errors of: ';
+  String _prevFix = '';
+
   String? startFix(List<Problem> problems, String log) {
     if (isBusy) return null;
-    final all = {...texts.keys, ...applied.keys};
-    final picked = <String>[];
-    for (final n in {for (final p in problems) if (p.file.isNotEmpty) p.file}) {
-      for (final k in all.where((k) => k == n || k.endsWith('/$n'))) {
-        if (!picked.contains(k)) picked.add(k);
+    final all = <String, String>{...texts, ...applied};
+    final wasFix = request.startsWith(_fixPrefix);
+    if (wasFix && changes.isNotEmpty) {
+      final sb = StringBuffer();
+      for (final c in changes.take(6)) {
+        final a = c.after;
+        sb.writeln('- ${c.path}${c.before == null ? ' (new file)' : ''}: ${a.length > 1500 ? '${a.substring(0, 1500)}\n…' : a}');
       }
+      _prevFix = '$_prevFix\nAttempt: these files were changed, but the build still FAILED with the errors above:\n$sb';
+      if (_prevFix.length > 12000) _prevFix = _prevFix.substring(_prevFix.length - 12000);
+    } else if (!wasFix) {
+      _prevFix = '';
     }
-    for (final c in changes) {
-      if (!picked.contains(c.path) && picked.length < 8) picked.add(c.path);
-    }
-    final files = picked.where((p) => cur(p) != null).take(8).toList();
+    final files = pickFixFiles(problems: problems, files: all, changed: [for (final c in changes) c.path]);
     if (files.isEmpty) return 'AIy could not tell which files the errors come from. Describe the problem in the request box instead.';
-    final orig = request;
+    final orig = wasFix ? request.substring(_fixPrefix.length) : request;
     final sb = StringBuffer('Project: $sourceName\n\nThe change "$orig" was applied and pushed, but the build on GitHub FAILED.\n\nErrors found in the build log:\n');
     for (final p in problems.take(8)) {
       sb.writeln('- ${p.file.isEmpty ? '' : '${p.file}${p.line > 0 ? ':${p.line}' : ''}: '}${p.title}${p.detail.isEmpty ? '' : ' (${p.detail})'}');
     }
     final tail = log.split('\n').map((l) => l.replaceFirst(RegExp(r'^\S*\d{4}-\d\d-\d\dT[\d:.]+Z '), '')).where((l) => l.trim().isNotEmpty).toList();
-    final lastLines = tail.skip(tail.length > 45 ? tail.length - 45 : 0).join('\n');
+    final lastLines = errorWindows(tail);
     sb.writeln('\nLast lines of the log:\n${lastLines.length > 4500 ? lastLines.substring(lastLines.length - 4500) : lastLines}\n');
-    sb.writeln('Fix the errors with the smallest possible change. These are the current files:\n');
+    if (_prevFix.isNotEmpty) {
+      sb.writeln('EARLIER FIX ATTEMPTS THAT DID NOT WORK (do not repeat them; find the real cause):$_prevFix');
+    }
+    sb.writeln('Rules: if a method, field or class is missing, look in the files below for where it should be defined. '
+        'Either add it there, or call the name that really exists. Never invent a name that is not defined in these files. '
+        'Fix every error listed, with the smallest possible change. These are the current files (the files the errors point at, '
+        'the files that define the names in the errors, their imports, and nearby files):\n');
     for (final p in files) {
       sb.writeln('=== FILE: $p ===\n${cur(p)}\n=== END OF $p ===\n');
     }
     _fixPrompt = sb.toString();
     targets = files;
-    request = 'Fix the build errors of: $orig';
+    request = '$_fixPrefix$orig';
     routeBadge = 'from the build log';
     changes = [];
     summary = outZip = usedModel = '';
@@ -761,8 +907,8 @@ class CodeState extends ChangeNotifier {
   Future<void> _loadHistory() async {
     try {
       final f = File('${(await _dir()).path}/history.json');
-      if (f.existsSync()) {
-        final j = jsonDecode(await f.readAsString());
+      {
+        final j = await Store.readJson(f);
         if (j is List) {
           history = [
             for (final b in j)
@@ -785,7 +931,7 @@ class CodeState extends ChangeNotifier {
           File(old.zip).deleteSync();
         } catch (_) {}
       }
-      await File('${(await _dir()).path}/history.json').writeAsString(jsonEncode([for (final b in history) b.toJson()]));
+      await Store.writeJson(File('${(await _dir()).path}/history.json'), [for (final b in history) b.toJson()]);
     } catch (e) {
       debugPrint('history save: $e');
     }

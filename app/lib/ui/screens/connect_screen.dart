@@ -12,6 +12,7 @@ import '../../state/net.dart';
 import '../../state/prefs.dart';
 import '../widgets/common.dart';
 import '../widgets/fx.dart';
+import '../../state/app_log.dart';
 
 class _Service {
   final String id;
@@ -38,6 +39,26 @@ const _services = [
     'Tap "Get my free key" and sign in with Google.',
     'Tap "Create API Key", give it any name, then copy the key.',
     'Come back to AIy. The key is picked up from the clipboard by itself.',
+  ], optional: true),
+  _Service('mistral', 'Mistral', Icons.air_rounded, 'A free European backup for chat (about a billion free words a month). The free plan may use what you send to train its models unless you switch that off in its settings.', 'https://console.mistral.ai/api-keys', [
+    'Tap \"Get my free key\", create an account and pick the free \"Experiment\" plan (no card).',
+    'Create an API key and copy it.',
+    'Come back to AIy and tap \"Paste it myself\".',
+  ], optional: true),
+  _Service('cerebras', 'Cerebras', Icons.bolt_rounded, 'Extremely fast answers. Short texts only on the free plan. Cerebras may give credits instead of a permanent free plan: check on their page.', 'https://cloud.cerebras.ai', [
+    'Tap \"Get my free key\" and sign in.',
+    'Create an API key and copy it.',
+    'Come back to AIy. The key is picked up from the clipboard by itself.',
+  ], optional: true),
+  _Service('nvidia', 'NVIDIA', Icons.memory_rounded, 'Free access to many open models from NVIDIA\'s catalog.', 'https://build.nvidia.com/settings/api-keys', [
+    'Tap \"Get my free key\" and sign in with a free NVIDIA account.',
+    'Tap \"Generate API key\" and copy it.',
+    'Come back to AIy. The key is picked up from the clipboard by itself.',
+  ], optional: true),
+  _Service('cloudflare', 'Cloudflare', Icons.cloud_outlined, 'A small free allowance every day. Needs two things: an API token and your account number.', 'https://dash.cloudflare.com/profile/api-tokens', [
+    'Tap \"Get my free key\", sign in, tap \"Create token\" and use the \"Workers AI\" template. Copy the token.',
+    'Your account number is in the address of the Cloudflare dashboard, or on the right of the Workers AI page.',
+    'Come back to AIy and tap \"Paste it myself\": it asks for both.',
   ], optional: true),
   _Service('github', 'GitHub', Icons.code_rounded, 'Lets AIy open your repositories, send the changes back and build the app for you.', 'https://github.com/settings/tokens/new?scopes=repo,workflow&description=AIy', [
     'Tap "Connect". AIy shows a short code.',
@@ -91,7 +112,9 @@ class _ConnectScreenState extends State<ConnectScreen> with WidgetsBindingObserv
       _lastClip = text;
       await _save(id, text);
       if (mounted) snack(context, '${AiEngine.names[id]} key found in the clipboard and saved.');
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('connect_screen:114: $e');
+    }
   }
 
   Future<void> _save(String id, String key) async {
@@ -113,14 +136,46 @@ class _ConnectScreenState extends State<ConnectScreen> with WidgetsBindingObserv
     }
   }
 
+  Future<void> _pasteCloudflare(_Service s) async {
+    final keys = context.read<KeyVault>();
+    final acct = TextEditingController(text: keys.get('cloudflare_acct'));
+    final tok = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Cloudflare'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: acct, decoration: const InputDecoration(labelText: 'Account number', hintText: '32 letters and numbers')),
+          const SizedBox(height: 10),
+          TextField(controller: tok, obscureText: true, decoration: const InputDecoration(labelText: 'API token')),
+          TextButton.icon(icon: const Icon(Icons.content_paste_rounded, size: 18), label: const Text('Paste the token from the clipboard'), onPressed: () async => tok.text = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? ''),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          FilledButton(style: FilledButton.styleFrom(minimumSize: const Size(64, 44)), onPressed: () => Navigator.pop(c, true), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final a = acct.text.trim();
+    final t = tok.text.trim();
+    if (a.isEmpty || t.isEmpty) {
+      if (mounted) snack(context, 'Both the account number and the token are needed.');
+      return;
+    }
+    await keys.set('cloudflare_acct', a);
+    await _save('cloudflare', t);
+  }
+
   Future<void> _paste(_Service s) async {
+    if (s.id == 'cloudflare') return _pasteCloudflare(s);
     final ctl = TextEditingController();
     final key = await showDialog<String>(
       context: context,
       builder: (c) => AlertDialog(
         title: Text('${s.name} key'),
         content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          TextField(controller: ctl, autofocus: true, obscureText: true, decoration: const InputDecoration(hintText: 'Paste the key here')),
+          TextField(controller: ctl, autofocus: true, obscureText: true, textInputAction: TextInputAction.done, onSubmitted: (v) => Navigator.pop(c, v.trim()), decoration: const InputDecoration(hintText: 'Paste the key here')),
           const SizedBox(height: 8),
           TextButton.icon(
             icon: const Icon(Icons.content_paste_rounded, size: 18),
@@ -175,6 +230,8 @@ class _ConnectScreenState extends State<ConnectScreen> with WidgetsBindingObserv
 
   Future<void> _disconnect(_Service s) async {
     if (await confirmDialog(context, 'Disconnect ${s.name}?', body: 'The key is removed from this phone. You can connect again any time.', yes: 'Disconnect')) {
+      if (!mounted) return;
+      if (s.id == 'cloudflare') await context.read<KeyVault>().set('cloudflare_acct', '');
       await _save(s.id, '');
     }
   }

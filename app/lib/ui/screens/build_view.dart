@@ -21,9 +21,29 @@ import '../widgets/timeline.dart';
 import 'diff_screen.dart';
 import 'model_picker.dart';
 import 'publish_panel.dart';
+import '../../state/app_log.dart';
+import '../widgets/progress_panel.dart';
 
 const _stages = ['describe', 'setup', 'questions', 'brief', 'write', 'done'];
 const _stageNames = ['Idea', 'Look', 'Questions', 'Brief', 'Write', 'Done'];
+
+/// How far the project is (0..1) for the small bar in the list.
+double _stageProgress(AppProject p) {
+  switch (p.stage) {
+    case 'describe':
+      return 0.1;
+    case 'setup':
+      return 0.25;
+    case 'questions':
+      return 0.3 + 0.35 * (p.count == 0 ? 0 : p.qa.where((q) => q.answer.isNotEmpty).length / p.count).clamp(0.0, 1.0);
+    case 'brief':
+      return 0.7;
+    case 'write':
+      return 0.85;
+    default:
+      return 1;
+  }
+}
 
 String _stageLabel(AppProject p) {
   switch (p.stage) {
@@ -92,7 +112,9 @@ class _BuildViewState extends State<BuildView> {
       final all = await context.read<AiEngine>().orModels();
       final m = all.where((m) => m.id == id).toList();
       if (mounted && m.isNotEmpty) setState(() => _model = m.first);
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('build_view:95: $e');
+    }
   }
 
   void _sync(AppProject p) {
@@ -197,19 +219,10 @@ class _BuildViewState extends State<BuildView> {
             child: AnimatedOpacity(
               opacity: showPill ? 1 : 0,
               duration: const Duration(milliseconds: 220),
-              child: Material(
-                color: t.colorScheme.inverseSurface,
-                borderRadius: BorderRadius.circular(999),
-                elevation: 6,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  child: Row(children: [
-                    const Orb(size: 28, busy: true),
-                    const SizedBox(width: 12),
-                    Expanded(child: Text(b.busy, maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(color: t.colorScheme.onInverseSurface, fontWeight: FontWeight.w600))),
-                  ]),
-                ),
-              ),
+              child: Builder(builder: (_) {
+                final pr = appProgress(b.phase, b.busy);
+                return ProgressPanel(icon: Icons.auto_awesome_outlined, title: b.phase.isEmpty ? 'Working' : 'Writing ${p.title}', steps: pr.steps, at: pr.at, live: b.busy);
+              }),
             ),
           ),
         ),
@@ -250,12 +263,23 @@ class _BuildViewState extends State<BuildView> {
         delay: 200,
         child: Pressable(
           onTap: b.newProject,
-          child: StepCard(
+          child: Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(28),
+              gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [t.colorScheme.primary, Color.lerp(t.colorScheme.primary, t.colorScheme.tertiary, 0.6)!]),
+              boxShadow: [BoxShadow(color: t.colorScheme.primary.withValues(alpha: 0.3), blurRadius: 24, offset: const Offset(0, 8))],
+            ),
             child: Row(children: [
-              CircleAvatar(radius: 24, backgroundColor: t.colorScheme.primary, child: Icon(Icons.add_rounded, color: t.colorScheme.onPrimary)),
+              CircleAvatar(radius: 24, backgroundColor: t.colorScheme.onPrimary.withValues(alpha: 0.18), child: Icon(Icons.auto_awesome_rounded, color: t.colorScheme.onPrimary)),
               const SizedBox(width: 14),
-              Expanded(child: Text('Start a new app', style: t.textTheme.titleMedium)),
-              const Icon(Icons.chevron_right_rounded),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Start a new app', style: t.textTheme.titleMedium?.copyWith(color: t.colorScheme.onPrimary)),
+                  Text('Describe it in your own words', style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onPrimary.withValues(alpha: 0.8))),
+                ]),
+              ),
+              Icon(Icons.arrow_forward_rounded, color: t.colorScheme.onPrimary),
             ]),
           ),
         ),
@@ -278,6 +302,21 @@ class _BuildViewState extends State<BuildView> {
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         Text(b.projects[i].title, style: t.textTheme.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
                         Text('${_stageLabel(b.projects[i])} · ${fmtDate(b.projects[i].updated)}', style: sub, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 8),
+                        TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 0, end: _stageProgress(b.projects[i])),
+                          duration: Duration(milliseconds: 700 + i * 60),
+                          curve: Curves.easeOutCubic,
+                          builder: (_, v, _) => ClipRRect(
+                            borderRadius: BorderRadius.circular(99),
+                            child: LinearProgressIndicator(
+                              value: v,
+                              minHeight: 4,
+                              backgroundColor: t.colorScheme.surfaceContainerHighest,
+                              color: v >= 1 ? const Color(0xFF34C759) : t.colorScheme.primary,
+                            ),
+                          ),
+                        ),
                       ]),
                     ),
                     IconButton(

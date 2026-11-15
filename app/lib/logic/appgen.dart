@@ -204,6 +204,11 @@ String genUser({
       sb.writeln('- $p');
     }
   }
+  if (problems.isEmpty && only.isNotEmpty) {
+    // Writing in parts: the other files come in other parts, so names must follow the list above exactly.
+    sb.writeln('\nThe app is written in parts. Files not shown above are written in other parts: refer to them by the paths and purposes in the list, '
+        'and give classes and functions the names those purposes suggest. Use package imports (package:<name>/...) matching the paths exactly.');
+  }
   sb.writeln('\nWrite ONLY these files now, each complete${only.isEmpty ? '' : ': ${only.join(', ')}'}.${problems.isEmpty ? '' : ' Fix every problem listed. If a file listed above is missing, write it.'}');
   return sb.toString();
 }

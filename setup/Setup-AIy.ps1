@@ -13,7 +13,7 @@ $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 # ------------------------------------------------------------------ constants
-$WizardVersion = '1.4.0'
+$WizardVersion = '1.21.1'
 $AppName = 'AIy'
 $Package = 'com.aiy.app'
 $KeyAlias = 'aiy'
@@ -589,7 +589,7 @@ function Test-RootGradleText([string]$text) {
   return ([regex]::Matches($text, 'aiy-sdk-hook\.gradle').Count -eq 1)
 }
 
-$ManifestPermissions = @('android.permission.INTERNET', 'android.permission.RECORD_AUDIO', 'android.permission.CAMERA', 'android.permission.REQUEST_INSTALL_PACKAGES', 'android.permission.POST_NOTIFICATIONS')
+$ManifestPermissions = @('android.permission.INTERNET', 'android.permission.RECORD_AUDIO', 'android.permission.CAMERA', 'android.permission.REQUEST_INSTALL_PACKAGES', 'android.permission.POST_NOTIFICATIONS', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.WAKE_LOCK')
 
 $BlockedPermissions = @('android.permission.READ_SMS', 'android.permission.RECEIVE_SMS')
 
@@ -604,6 +604,11 @@ function Update-ManifestText([string]$text) {
   $t = $t.Replace('android:name="${applicationName}"', 'android:name=".AIyApp"')
   if ($t -notmatch 'android:roundIcon=') {
     $t = [regex]::Replace($t, '(?m)^([ \t]*)android:icon="@mipmap/ic_launcher"', ('${1}android:icon="@mipmap/ic_launcher"' + "`n" + '${1}android:roundIcon="@mipmap/ic_launcher_round"'), 1)
+  }
+  # no Android auto-backup / phone-to-phone copy of app data: the vault key cannot move, so copied keys could never be opened.
+  # AIy has its own backup (Settings > Backup). aiy-no-backup
+  if ($t -notmatch 'android:allowBackup=') {
+    $t = [regex]::Replace($t, '(?m)^([ \t]*)android:icon="@mipmap/ic_launcher"', ('${1}android:icon="@mipmap/ic_launcher"' + "`n" + '${1}android:allowBackup="false"' + "`n" + '${1}android:fullBackupContent="false"'), 1)
   }
   if ($t -notmatch 'aiy-crash-activity') {
     $ca = @(
@@ -664,6 +669,14 @@ function Update-ManifestText([string]$text) {
     $ra = New-Object regex '(?s)(<activity\b[^>]*android:name="\.MainActivity".*?)(\n[ \t]*</activity>)'
     if ($ra.IsMatch($t)) { $t = $ra.Replace($t, { param($m) $m.Groups[1].Value + "`n" + $sf + $m.Groups[2].Value }, 1) }
   }
+  # keep working in the background: a foreground service shows the "AIy is working" notification
+  if ($t -notmatch 'aiy-work-service') {
+    $ws = @(
+      '        <!-- aiy-work-service -->',
+      '        <service android:name=".AIyWorkService" android:exported="false" android:foregroundServiceType="dataSync"/>') -join "`n"
+    $rw = New-Object regex '(?m)^([ \t]*)</application>'
+    $t = $rw.Replace($t, { param($m) $ws + "`n" + $m.Value }, 1)
+  }
   # in-app updates: the downloaded APK is shared with the Android installer through this provider
   if ($t -notmatch 'aiy-file-provider') {
     $fp = @(
@@ -682,11 +695,13 @@ function Test-ManifestText([string]$text) {
   if ($text -notmatch 'android:name="\.AIyApp"') { return $false }
   if ([regex]::Matches($text, 'aiy-crash-activity').Count -ne 1) { return $false }
   if ($text -notmatch 'android:roundIcon="@mipmap/ic_launcher_round"') { return $false }
+  if ([regex]::Matches($text, 'android:allowBackup="false"').Count -ne 1) { return $false }
   foreach ($bp in $BlockedPermissions) { if ($text -match [regex]::Escape($bp)) { return $false } }
   if ([regex]::Matches($text, 'android\.speech\.RecognitionService').Count -ne 1) { return $false }
   if ([regex]::Matches($text, 'aiy-browser-query').Count -ne 1) { return $false }
   if ([regex]::Matches($text, 'aiy-file-provider').Count -ne 1) { return $false }
   if ([regex]::Matches($text, 'aiy-share-filters').Count -ne 1) { return $false }
+  if ([regex]::Matches($text, 'aiy-work-service').Count -ne 1) { return $false }
   if ([regex]::Matches($text, 'android\.intent\.action\.TTS_SERVICE').Count -ne 1) { return $false }
   foreach ($perm in $ManifestPermissions) {
     if ([regex]::Matches($text, ('<uses-permission\s+android:name="' + [regex]::Escape($perm) + '"')).Count -ne 1) { return $false }
@@ -716,6 +731,10 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -737,6 +756,7 @@ import java.security.KeyStore
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.nio.charset.Charset
 import java.util.zip.ZipOutputStream
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -755,6 +775,7 @@ class MainActivity : FlutterFragmentActivity() {
         super.configureFlutterEngine(flutterEngine)
         val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "aiy/native")
         channel = ch
+        instance = this
         handleShare(intent)
         ch.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -780,7 +801,11 @@ class MainActivity : FlutterFragmentActivity() {
                 }
                 "installApk" -> {
                     try {
-                        val file = File(call.argument<String>("path") ?: "")
+                        val src = File(call.argument<String>("path") ?: "")
+                        // The installer may only read files under cache/updates: copy the APK there first.
+                        val dir = File(cacheDir, "updates")
+                        dir.mkdirs()
+                        val file = if (src.parentFile?.canonicalPath == dir.canonicalPath) src else File(dir, "AIy-update.apk").also { src.copyTo(it, overwrite = true) }
                         val uri = FileProvider.getUriForFile(this, packageName + ".aiyfiles", file)
                         val intent = Intent(Intent.ACTION_VIEW)
                             .setDataAndType(uri, "application/vnd.android.package-archive")
@@ -792,7 +817,12 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
                 "secretGet" -> {
-                    result.success(secretGet(call.argument<String>("name") ?: ""))
+                    try {
+                        result.success(secretGet(call.argument<String>("name") ?: ""))
+                    } catch (e: Exception) {
+                        // Stored, but this phone's vault key cannot open it (backup moved to a new phone, or the key was reset).
+                        result.error("KEY_LOST", e.javaClass.simpleName + ": " + (e.message ?: ""), null)
+                    }
                 }
                 "secretSet" -> {
                     try {
@@ -848,12 +878,55 @@ class MainActivity : FlutterFragmentActivity() {
                         }
                     }
                 }
+                "workShow" -> {
+                    try {
+                        val i = Intent(this, AIyWorkService::class.java)
+                            .putExtra("title", call.argument<String>("title") ?: "AIy is working")
+                            .putExtra("text", call.argument<String>("text") ?: "")
+                        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
+                "networkKind" -> {
+                    // wifi (not metered) | metered (a Wi-Fi hotspot that costs data) | cellular | other | none
+                    try {
+                        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                        val nc = cm.getNetworkCapabilities(cm.activeNetwork)
+                        val kind = when {
+                            nc == null -> "none"
+                            nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) || nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) ->
+                                if (cm.isActiveNetworkMetered) "metered" else "wifi"
+                            nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                            else -> "other"
+                        }
+                        result.success(kind)
+                    } catch (e: Exception) {
+                        result.success("unknown")
+                    }
+                }
+                "storageFree" -> {
+                    try {
+                        val st = android.os.StatFs(filesDir.absolutePath)
+                        result.success(st.availableBytes)
+                    } catch (e: Exception) {
+                        result.success(-1L)
+                    }
+                }
+                "workHide" -> {
+                    try {
+                        stopService(Intent(this, AIyWorkService::class.java))
+                    } catch (e: Exception) {
+                    }
+                    result.success(true)
+                }
                 "takeShared" -> {
                     val v = pendingShare
                     pendingShare = null
                     result.success(v)
                 }
-                "zipScan", "zipRead", "zipRebuild", "zipCreate", "zipBytes", "zipExtractFirst", "saveToDownloads" -> background(call, result)
+                "zipScan", "zipRead", "zipRebuild", "zipCreate", "zipBytes", "zipExtractFirst", "saveToDownloads", "shrinkImage" -> background(call, result)
                 else -> result.notImplemented()
             }
         }
@@ -887,7 +960,17 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun onDestroy() {
         tts?.shutdown()
+        if (instance === this) instance = null
         super.onDestroy()
+    }
+
+    companion object {
+        var instance: MainActivity? = null
+    }
+
+    // The "Stop" button of the "AIy is working" notification: tell the Flutter side.
+    fun workStopped() {
+        runOnUiThread { channel?.invokeMethod("onWorkStop", null) }
     }
 
     // ---- things shared into AIy from other apps (text, photos, PDFs, zips)
@@ -996,18 +1079,15 @@ class MainActivity : FlutterFragmentActivity() {
         sp.edit().putString(name, Base64.encodeToString(packed, Base64.NO_WRAP)).apply()
     }
 
-    // Null when nothing is stored, or when it cannot be decrypted (for example after restoring a backup on a new phone).
+    // Null when nothing is stored. Throws when something is stored but cannot be decrypted
+    // (for example after Android copied the app data to a new phone: the vault key never leaves the old one).
     private fun secretGet(name: String): String? {
-        return try {
-            val raw = getSharedPreferences("aiy_vault", MODE_PRIVATE).getString(name, null) ?: return null
-            val packed = Base64.decode(raw, Base64.NO_WRAP)
-            if (packed.size < 13) return null
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, vaultKey(), GCMParameterSpec(128, packed, 0, 12))
-            String(cipher.doFinal(packed, 12, packed.size - 12), Charsets.UTF_8)
-        } catch (e: Exception) {
-            null
-        }
+        val raw = getSharedPreferences("aiy_vault", MODE_PRIVATE).getString(name, null) ?: return null
+        val packed = Base64.decode(raw, Base64.NO_WRAP)
+        if (packed.size < 13) throw IllegalStateException("stored value is too short")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, vaultKey(), GCMParameterSpec(128, packed, 0, 12))
+        return String(cipher.doFinal(packed, 12, packed.size - 12), Charsets.UTF_8)
     }
 
     // Zip work can take a while: never on the main thread.
@@ -1032,6 +1112,7 @@ class MainActivity : FlutterFragmentActivity() {
                         call.argument<Map<String, ByteArray>>("bytes") ?: emptyMap()
                     )
                     "zipBytes" -> zipBytes(call.argument<String>("path") ?: "", call.argument<String>("name") ?: "")
+                    "shrinkImage" -> shrinkImage(call.argument<String>("path") ?: "", call.argument<Int>("maxSide") ?: 1024, call.argument<Int>("quality") ?: 65)
                     "zipExtractFirst" -> zipExtractFirst(
                         call.argument<String>("path") ?: "",
                         call.argument<String>("ext") ?: ".apk",
@@ -1047,13 +1128,83 @@ class MainActivity : FlutterFragmentActivity() {
         }.start()
     }
 
+    // Makes a photo smaller (fewer pixels, JPEG) so less has to travel over a slow line. Returns the new file, or null.
+    private fun shrinkImage(path: String, maxSide: Int, quality: Int): String? {
+        val bounds = BitmapFactory.Options()
+        bounds.inJustDecodeBounds = true
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
+        val opts = BitmapFactory.Options()
+        opts.inSampleSize = sample
+        var bmp = BitmapFactory.decodeFile(path, opts) ?: return null
+        val longest = maxOf(bmp.width, bmp.height)
+        if (longest > maxSide) {
+            val k = maxSide.toFloat() / longest
+            bmp = Bitmap.createScaledBitmap(bmp, maxOf(1, (bmp.width * k).toInt()), maxOf(1, (bmp.height * k).toInt()), true)
+        }
+        var degrees = 0f
+        try {
+            val o = ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            degrees = when (o) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+        } catch (e: Throwable) {
+        }
+        if (degrees != 0f) {
+            val m = Matrix()
+            m.postRotate(degrees)
+            bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        val out = File(path + ".s.jpg")
+        FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.JPEG, quality, it) }
+        return out.absolutePath
+    }
+
+    // Zips made by Windows' "Send to compressed folder" store non-English file names in the old DOS code page,
+    // and some tools write "folder\file". Open with UTF-8 first, fall back to CP437; names always use "/".
+    private fun openZip(f: File): ZipFile {
+        try {
+            val z = ZipFile(f)
+            try {
+                val en = z.entries()
+                while (en.hasMoreElements()) en.nextElement().name
+                return z
+            } catch (e: Exception) {
+                z.close()
+                throw e
+            }
+        } catch (e: Exception) {
+            if (e is java.io.FileNotFoundException) throw e
+            return ZipFile(f, Charset.forName("IBM437"))
+        }
+    }
+
+    private fun norm(n: String): String = n.replace('\\', '/')
+
+    private fun entryIndex(z: ZipFile): Map<String, ZipEntry> {
+        val m = HashMap<String, ZipEntry>()
+        val en = z.entries()
+        while (en.hasMoreElements()) {
+            val e = en.nextElement()
+            m.putIfAbsent(norm(e.name), e)
+        }
+        return m
+    }
+
     private fun zipScan(path: String): List<Map<String, Any>> {
         val out = ArrayList<Map<String, Any>>()
-        ZipFile(File(path)).use { z ->
+        openZip(File(path)).use { z ->
+            val seen = HashSet<String>()
             val en = z.entries()
             while (en.hasMoreElements()) {
                 val e = en.nextElement()
-                if (!e.isDirectory) out.add(mapOf("name" to e.name, "size" to e.size))
+                val n = norm(e.name)
+                if (!e.isDirectory && !n.endsWith("/") && seen.add(n)) out.add(mapOf("name" to n, "size" to e.size))
             }
         }
         return out
@@ -1062,13 +1213,16 @@ class MainActivity : FlutterFragmentActivity() {
     // Text of the named files. Files that are too big or look binary are left out.
     private fun zipRead(path: String, names: List<String>, maxBytes: Int): Map<String, String> {
         val out = HashMap<String, String>()
-        ZipFile(File(path)).use { z ->
+        openZip(File(path)).use { z ->
+            val idx = entryIndex(z)
             for (n in names) {
-                val e = z.getEntry(n) ?: continue
+                val e = idx[n] ?: continue
                 if (e.isDirectory || e.size > maxBytes) continue
                 val bytes = z.getInputStream(e).use { it.readBytes() }
                 if (bytes.size > maxBytes || bytes.contains(0.toByte())) continue
-                out[n] = String(bytes, Charsets.UTF_8)
+                // The invisible UTF-8 "BOM" at the start is dropped for the AI (zipRebuild puts it back).
+                val start = if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()) 3 else 0
+                out[n] = String(bytes, start, bytes.size - start, Charsets.UTF_8)
             }
         }
         return out
@@ -1081,18 +1235,22 @@ class MainActivity : FlutterFragmentActivity() {
         val left = HashMap<String, String>(files)
         val seen = HashSet<String>()
         var changed = 0
-        ZipFile(File(src)).use { z ->
+        openZip(File(src)).use { z ->
             ZipOutputStream(FileOutputStream(target).buffered()).use { out ->
                 val en = z.entries()
                 while (en.hasMoreElements()) {
                     val e = en.nextElement()
-                    if (!seen.add(e.name)) continue
-                    val text = if (e.isDirectory) null else left.remove(e.name)
-                    val ne = ZipEntry(e.name)
+                    val name = norm(e.name)
+                    if (!seen.add(name)) continue
+                    val text = if (e.isDirectory) null else left.remove(name)
+                    val ne = ZipEntry(name)
                     if (text == null && e.time > 0) ne.time = e.time
                     out.putNextEntry(ne)
                     if (!e.isDirectory) {
                         if (text != null) {
+                            // Keep a UTF-8 BOM the original file had (some Windows tools need it).
+                            val head = z.getInputStream(e).use { val b = ByteArray(3); val r = it.read(b); if (r == 3) b else ByteArray(0) }
+                            if (head.size == 3 && head[0] == 0xEF.toByte() && head[1] == 0xBB.toByte() && head[2] == 0xBF.toByte() && !text.startsWith("\uFEFF")) out.write(head)
                             out.write(text.toByteArray(Charsets.UTF_8))
                             changed++
                         } else {
@@ -1134,8 +1292,8 @@ class MainActivity : FlutterFragmentActivity() {
 
     // The bytes of one file in the zip (pictures and other binary files that are uploaded to GitHub).
     private fun zipBytes(path: String, name: String): ByteArray {
-        ZipFile(File(path)).use { z ->
-            val e = z.getEntry(name) ?: throw IllegalStateException("Not found in the zip: " + name)
+        openZip(File(path)).use { z ->
+            val e = entryIndex(z)[name] ?: throw IllegalStateException("Not found in the zip: " + name)
             if (e.size > 90L * 1024 * 1024) throw IllegalStateException(name + " is bigger than 90 MB: GitHub will not take it")
             return z.getInputStream(e).use { it.readBytes() }
         }
@@ -1143,7 +1301,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     // Takes the first file with this ending (".apk") out of a zip. Returns its path, or null.
     private fun zipExtractFirst(path: String, ext: String, dir: String): String? {
-        ZipFile(File(path)).use { z ->
+        openZip(File(path)).use { z ->
             val en = z.entries()
             while (en.hasMoreElements()) {
                 val e = en.nextElement()
@@ -1208,11 +1366,108 @@ class MainActivity : FlutterFragmentActivity() {
 }
 '@
 
+$WorkServiceKotlin = @'
+// aiy-work-service: generated by the setup wizard (do not edit).
+// A foreground service: while AIy works (a long answer, writing an app, a build, waiting for the internet) it shows
+// the "AIy is working" notification, so Android keeps the app running in the background.
+package {PKG}
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+
+class AIyWorkService : Service() {
+    private var wake: PowerManager.WakeLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "aiy.stop") {
+            MainActivity.instance?.workStopped()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val title = intent?.getStringExtra("title") ?: "AIy is working"
+        val text = intent?.getStringExtra("text") ?: ""
+        try {
+            show(title, text)
+        } catch (e: Throwable) {
+            stopSelf()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun show(title: String, text: String) {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel("aiy_work", "AIy working", NotificationManager.IMPORTANCE_LOW))
+        val open = packageManager.getLaunchIntentForPackage(packageName) ?: Intent()
+        val openPi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val stopIntent = Intent(this, AIyWorkService::class.java).setAction("aiy.stop")
+        val stopPi = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "aiy_work") else Notification.Builder(this)
+        val stat = resources.getIdentifier("ic_stat_aiy", "drawable", packageName)
+        b.setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setSmallIcon(if (stat != 0) stat else applicationInfo.icon)
+            .setContentIntent(openPi)
+            .setOngoing(true)
+            .addAction(0, "Stop", stopPi)
+        val n = b.build()
+        try {
+            if (Build.VERSION.SDK_INT >= 29) startForeground(7001, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(7001, n)
+        } catch (e: Exception) {
+            // Android 12+ refuses a foreground service started from the background, and Android 15 limits dataSync
+            // to about 6 hours a day. Without the service the work goes on while AIy is open; never crash for it.
+            android.util.Log.w("AIy", "foreground service refused: " + e)
+            stopSelf()
+            return
+        }
+        if (wake == null) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val w = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "aiy:work")
+            w.setReferenceCounted(false)
+            wake = w
+        }
+        // Kept awake only while the notification is up; refreshed by every update, never longer than 30 minutes at a time.
+        wake?.acquire(30 * 60 * 1000L)
+    }
+
+    // Android 15: the daily dataSync time is used up. The service must stop at once, or Android ends the app.
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        android.util.Log.w("AIy", "foreground service time limit reached")
+        stopSelf()
+    }
+
+    override fun onTimeout(startId: Int) {
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        try {
+            val w = wake
+            if (w != null && w.isHeld) w.release()
+        } catch (e: Throwable) {
+        }
+        super.onDestroy()
+    }
+}
+'@
+
 $FilePathsXml = @'
 <?xml version="1.0" encoding="utf-8"?>
 <!-- aiy-file-paths: generated by the setup wizard. Where the downloaded update APK lives. -->
 <paths>
     <cache-path name="aiy_updates" path="updates/" />
+    <files-path name="aiy_app_updates" path="../app_flutter/aiy/updates/" />
 </paths>
 '@
 
@@ -1366,6 +1621,7 @@ function Get-WidgetFiles {
     (Join-Path $mi.Dir 'CrashActivity.kt') = ($CrashKotlin -replace '\{PKG\}', $mi.Package)
     (Join-Path (Join-Path $res 'xml') 'aiy_file_paths.xml') = $FilePathsXml
     (Join-Path $mi.Dir 'AIyFileProvider.kt') = ($FileProviderKotlin -replace '\{PKG\}', $mi.Package)
+    (Join-Path $mi.Dir 'AIyWorkService.kt') = ($WorkServiceKotlin -replace '\{PKG\}', $mi.Package)
   }
 }
 
@@ -2516,11 +2772,22 @@ function Show-FinalScreen {
     'Share into AIy: in another app (browser, gallery, files) tap Share and pick AIy, once with text, once with a photo, once with a project zip. AIy asks Chat, Code or Build each time; try each one.',
     'Chat: long-press an answer (or tap the three dots under it) > Answer again with another model. Open the menu: make a folder with the + Folder chip, move a chat into it (three dots on the chat), long-press the folder chip to rename or delete it, and try the search box.',
     'OpenRouter pop-up: in Code pick a paid model while the OpenRouter account has no credit (or switch the internet off during a request). A pop-up must explain the problem; try Details, Copy, Retry and Switch model (the price of the new model is shown before anything is sent).',
+    'Slow line: use a very slow connection (a weak hotspot, or limit the speed in the router). Ask for a long answer: AIy must wait longer instead of failing, and after two timeouts a yellow banner must say the internet is slow and offer Lite mode. Turn Lite mode on: the box says "Ask AIy (Lite mode)", photos get smaller, answers get shorter. Settings > Slow connection has the same switch. Download an update or a built APK and switch the connection off for a moment in the middle: it must continue, not start again.',
+    'More free AI: in Settings > Accounts & keys connect Mistral, Cerebras, NVIDIA and Cloudflare (Cloudflare asks for the account number and the token). Each must show a green tick after its test; Settings > Help > Test everything lists them. Then in chat tap the sliders icon (Advanced mode) and choose one as "first": the answer badge shows who answered.',
+    'Background: start a long Build-tab app and press Home. A quiet "AIy is working" notification must stay with the current step (for example the file being written); the work must finish while the phone is in your pocket. Tap Stop in the notification: the work ends. Also start a chat answer, switch flight mode on, close AIy from the recent apps, open it again with the internet back: the chat should ask again by itself.',
+    'Internet loss: start a long chat answer, a Code patch with a paid model and a Build tab question, switch on flight mode in the middle. A red banner must say how many requests wait (open the list, try Cancel). Switch flight mode off: a notification arrives, the banner says it is sending again, and the answers come by themselves. After a paid request was lost, Settings > Spending may show a small "lost" cost.',
     'The orb: it turns fast while AIy thinks, shows rings while you use the microphone, and swells while an answer is read aloud. Build tab > Write the app and the GitHub build screen show a list of steps with ticks.',
     'Chat: attach a photo (+ button) and ask about it; switch on the globe (live search) and ask about today''s news; try the microphone.',
     'Code: pick a project zip. Check the numbers (all files -> source files), then "Explain this codebase".',
     'Code: type a small change, "Find the files", pick a model (try a free one first), confirm the cost, wait for the patch.',
     'Code: open the diff of each file, then Save to Downloads / Share the new zip. Unzip it on the PC and check it still builds.',
+    'Retries (1.13.0): switch on flight mode while a Code or Build job writes: the busy text counts Try 2 of 5; after 5 tries the job waits; switch the internet on: a free job continues by itself, a paid job asks (Continue / Discard) with the price.',
+    'Updates (1.12.0): publish a newer version, open AIy on Wi-Fi: the update downloads by itself (notification with %), leave AIy and come back, it continues; when done a banner with Install appears. Settings > Update shows What is new, Pause, Skip.',
+    'Job pages (1.9.0): start a build, open Settings > Running and waiting: steps animate; a failed build shows the error card under the step where it stopped.',
+    'GitHub build (1.8.0): push a change to a NEW branch, then Build the app: the build must start within a minute or two and download the APK.',
+    'Review (1.8.0): in Code, open a changed file with several changes, turn one off, push: only the kept changes reach GitHub. Settings > Storage and Running and waiting must open.',
+    'Errors (1.7.0): turn on flight mode while Code writes a paid change, close AIy, turn the internet on and open AIy: a card must ask Continue / Discard with the price. On an error card try Ask AIy and Copy report.',
+    'Safe data (1.6.1): Settings > Backup > Export, then Restore the same file: it must say Restored and your chats stay. Settings > About must show 1.6.1.',
     'Settings > Help > Test everything: every line should be green (a yellow note is fine). Tap Copy the report.',
     'Chat: attach a text file and ask about it, attach a PDF, long-press your message > Edit and ask again, tap the refresh icon, the speaker icon (read aloud), the sliders icon (which AI answers); drawer > Share this chat.',
     'Settings > Security: switch the app lock on, leave AIy for the chosen time and come back; try the fingerprint; Save a backup, then Restore it.',

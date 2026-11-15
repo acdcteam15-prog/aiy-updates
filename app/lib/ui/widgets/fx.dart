@@ -322,10 +322,11 @@ class StepCard extends StatelessWidget {
   final Widget child;
   final EdgeInsets padding;
   final Color? color;
-  const StepCard({super.key, required this.child, this.padding = const EdgeInsets.all(18), this.color});
+  const StepCard({super.key, required this.child, this.padding = const EdgeInsets.all(20), this.color});
   @override
   Widget build(BuildContext context) => Card(
-        color: color ?? Theme.of(context).colorScheme.surfaceContainerHigh.withValues(alpha: 0.92),
+        // same look as the job pages: the theme's card (surface container, soft border, 28 px corners)
+        color: color ?? Theme.of(context).colorScheme.surfaceContainer.withValues(alpha: 0.95),
         clipBehavior: Clip.antiAlias,
         child: AnimatedSize(
           duration: const Duration(milliseconds: 260),
@@ -334,4 +335,65 @@ class StepCard extends StatelessWidget {
           child: Padding(padding: padding, child: child),
         ),
       );
+}
+
+/// A soft light that sweeps over grey placeholder shapes while something loads.
+class Shimmer extends StatefulWidget {
+  final Widget child;
+  const Shimmer({super.key, required this.child});
+  @override
+  State<Shimmer> createState() => _ShimmerState();
+}
+
+class _ShimmerState extends State<Shimmer> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1300))..repeat();
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = Theme.of(context).colorScheme;
+    return AnimatedBuilder(
+      animation: _c,
+      child: widget.child,
+      builder: (_, c) => ShaderMask(
+        blendMode: BlendMode.srcATop,
+        shaderCallback: (r) => LinearGradient(
+          begin: Alignment(-1.5 + 3 * _c.value, 0),
+          end: Alignment(-0.5 + 3 * _c.value, 0),
+          colors: [s.surfaceContainerHighest, s.onSurface.withValues(alpha: 0.12), s.surfaceContainerHighest],
+        ).createShader(r),
+        child: c,
+      ),
+    );
+  }
+}
+
+/// Grey rounded rows shown while a list loads.
+class SkeletonList extends StatelessWidget {
+  final int rows;
+  const SkeletonList({super.key, this.rows = 6});
+  @override
+  Widget build(BuildContext context) {
+    final s = Theme.of(context).colorScheme;
+    Widget bar(double w, double h) => Container(width: w, height: h, decoration: BoxDecoration(color: s.surfaceContainerHighest, borderRadius: BorderRadius.circular(8)));
+    return Shimmer(
+      child: ListView(physics: const NeverScrollableScrollPhysics(), padding: const EdgeInsets.fromLTRB(12, 8, 12, 0), children: [
+        for (var i = 0; i < rows; i++)
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), border: Border.all(color: s.outlineVariant.withValues(alpha: 0.3))),
+            child: Row(children: [
+              Container(width: 40, height: 40, decoration: BoxDecoration(color: s.surfaceContainerHighest, borderRadius: BorderRadius.circular(12))),
+              const SizedBox(width: 12),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [bar(160 + (i % 3) * 30.0, 12), const SizedBox(height: 8), bar(90, 10)])),
+            ]),
+          ),
+      ]),
+    );
+  }
 }

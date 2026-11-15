@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'app_log.dart';
 
 /// One file that another app shared into AIy (already copied into AIy's cache).
 class SharedFile {
@@ -47,12 +48,52 @@ class Native {
   static final ValueNotifier<bool> speaking = ValueNotifier<bool>(false);
 
   // ---- share into AIy
-  /// Called when another app shares something while AIy is already open (the data is fetched with [takeShared]).
-  static void listenShared(void Function() onShared) {
+  static void Function()? _onShared;
+  static final List<void Function()> _onWorkStop = [];
+  static bool _handlerSet = false;
+
+  static void _install() {
+    if (_handlerSet) return;
+    _handlerSet = true;
     _ch.setMethodCallHandler((call) async {
-      if (call.method == 'onShared') onShared();
+      if (call.method == 'onShared') _onShared?.call();
+      if (call.method == 'onWorkStop') {
+        for (final f in List.of(_onWorkStop)) {
+          f();
+        }
+      }
       return null;
     });
+  }
+
+  /// Called when another app shares something while AIy is already open (the data is fetched with [takeShared]).
+  static void listenShared(void Function() onShared) {
+    _onShared = onShared;
+    _install();
+  }
+
+  /// Called when the person taps "Stop" in the "AIy is working" notification.
+  static void listenWorkStop(void Function() onStop) {
+    _onWorkStop.add(onStop);
+    _install();
+  }
+
+  /// Shows (or updates) the "AIy is working" notification and keeps the app running in the background.
+  static Future<void> workShow(String title, String text) async {
+    try {
+      await _ch.invokeMethod<bool>('workShow', {'title': title, 'text': text});
+    } catch (e) {
+      debugPrint('native workShow: $e');
+    }
+  }
+
+  /// Removes the notification; the app may sleep in the background again.
+  static Future<void> workHide() async {
+    try {
+      await _ch.invokeMethod<bool>('workHide');
+    } catch (e) {
+      AppLog.i('native:89: $e');
+    }
   }
 
   /// What was shared into AIy (once; null when nothing is waiting).
@@ -97,7 +138,9 @@ class Native {
   static Future<void> openInstallSettings() async {
     try {
       await _ch.invokeMethod<bool>('openInstallSettings');
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('native:134: $e');
+    }
   }
 
   static Future<void> installApk(String path) async {
@@ -105,17 +148,42 @@ class Native {
   }
 
   // ---- key vault (values are encrypted with a key that never leaves the phone's secure hardware)
+  /// The kind of connection: wifi (not metered), metered (a hotspot that costs data), cellular, other, none,
+  /// or unknown when the phone cannot tell. Updates download by themselves only on "wifi".
+  static Future<String> networkKind() async {
+    try {
+      return (await _ch.invokeMethod<String>('networkKind')) ?? 'unknown';
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  /// Free space for AIy's files in bytes (-1 when unknown, e.g. an older wizard build).
+  static Future<int> storageFree() async {
+    try {
+      return (await _ch.invokeMethod<int>('storageFree')) ?? -1;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  /// '' when nothing is stored. Throws [VaultError] when something is stored but cannot be opened on this phone.
   static Future<String> secretGet(String name) async {
     try {
       return (await _ch.invokeMethod<String>('secretGet', {'name': name})) ?? '';
-    } catch (e) {
-      debugPrint('native secretGet: $e');
+    } on PlatformException catch (e) {
+      throw VaultError(name, e.code == 'KEY_LOST', '${e.code}: ${e.message ?? ''}');
+    } on MissingPluginException {
       return '';
     }
   }
 
   static Future<void> secretSet(String name, String value) async {
-    await _ch.invokeMethod<bool>('secretSet', {'name': name, 'value': value});
+    try {
+      await _ch.invokeMethod<bool>('secretSet', {'name': name, 'value': value});
+    } on PlatformException catch (e) {
+      throw VaultError(name, false, '${e.code}: ${e.message ?? ''}');
+    }
   }
 
   /// Opens a web page in the phone's browser.
@@ -134,6 +202,16 @@ class Native {
     return (path: '${m['path']}', name: '${m['name']}', size: (m['size'] as num?)?.toInt() ?? 0);
   }
 
+  /// Makes a photo smaller (at most [maxSide] pixels on the long side, JPEG [quality]) and returns the new file, or null.
+  static Future<String?> shrinkImage(String path, {int maxSide = 1024, int quality = 65}) async {
+    try {
+      return await _ch.invokeMethod<String>('shrinkImage', {'path': path, 'maxSide': maxSide, 'quality': quality});
+    } catch (e) {
+      debugPrint('native shrinkImage: $e');
+      return null;
+    }
+  }
+
   /// Reads text aloud with the phone's own voice.
   static Future<void> speak(String text) async {
     try {
@@ -147,7 +225,9 @@ class Native {
     speaking.value = false;
     try {
       await _ch.invokeMethod<bool>('stopSpeaking');
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('native:200: $e');
+    }
   }
 
   /// A notification (used when a build finishes while AIy is in the background).
@@ -162,7 +242,9 @@ class Native {
   static Future<void> requestNotifications() async {
     try {
       await _ch.invokeMethod<bool>('requestNotifications');
-    } catch (_) {}
+    } catch (e) {
+      AppLog.i('native:215: $e');
+    }
   }
 
   // ---- project zips
@@ -212,4 +294,20 @@ class Native {
   static Future<String> saveToDownloads(String path, String name) async {
     return (await _ch.invokeMethod<String>('saveToDownloads', {'path': path, 'name': name})) ?? '';
   }
+}
+
+
+/// The phone's key vault could not read or save a key.
+class VaultError implements Exception {
+  final String name;
+
+  /// True when the key is stored but this phone cannot open it (the data was copied from another phone).
+  final bool lost;
+  final String detail;
+  VaultError(this.name, this.lost, this.detail);
+
+  @override
+  String toString() => lost
+      ? 'The saved $name key cannot be opened on this phone (it was probably copied from another phone). Connect it again: Settings > Connect.'
+      : 'The phone\'s secure key store did not accept the $name key ($detail). Restart the phone and try again; if it keeps failing, remove and add the screen lock once, then connect again.';
 }
