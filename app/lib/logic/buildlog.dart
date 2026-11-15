@@ -44,6 +44,8 @@ List<Problem> parseProblems(List<String> raw) {
     } else if (s.startsWith('* What went wrong:')) {
       final next = lines.skip(i + 1).take(4).where((l) => l.isNotEmpty && !l.startsWith('*')).toList();
       if (next.isNotEmpty) add(next[0], detail: next.skip(1).take(2).join(' '));
+    } else if (s.startsWith('Flutter failed to read file') || s.startsWith('PathNotFoundException')) {
+      add(s);
     } else if (s.contains('##[error]')) {
       add(s.replaceAll('##[error]', ''));
     } else if (_titles.hasMatch(s)) {
@@ -66,6 +68,9 @@ String environmentFailure(String text) {
   if (RegExp(r'requires libraries and applications that depend on it to compile against version \d+', caseSensitive: false).hasMatch(t) ||
       t.contains('AAR metadata')) {
     return 'a plugin needs a newer Android version than the build uses';
+  }
+  if (RegExp(r'Flutter failed to read file at .*[\\/]android[\\/]|PathNotFoundException.*[\\/]android[\\/]').hasMatch(t)) {
+    return 'the Android part of the project is incomplete (android/app/build.gradle is missing)';
   }
   final jdk = RegExp(r'Unsupported class file major version|Android Gradle plugin requires Java \d+|requires Java \d+ to run').firstMatch(t);
   if (jdk != null) return 'the Java version used by the build does not match Gradle or Android';

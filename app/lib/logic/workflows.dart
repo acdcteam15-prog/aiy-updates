@@ -12,7 +12,7 @@ const String kBuildTrigger = '.aiy/build-request.txt';
 const String kCheckTrigger = '.aiy/check-request.txt';
 
 /// Written into AIy's own workflow files. An AIy workflow without the current mark is replaced on the next build.
-const String kWorkflowMark = '# aiy-workflow v6';
+const String kWorkflowMark = '# aiy-workflow v7';
 
 bool isAiyWorkflow(String? text) => text != null && (text.contains('name: AIy build') || text.contains('name: AIy quick check'));
 bool isCurrentAiyWorkflow(String? text) => text != null && text.contains(kWorkflowMark);
@@ -50,7 +50,7 @@ const String _signing = r'''      - name: Use one fixed signing key
 
 
 const String _head = r'''name: AIy build
-# aiy-workflow v6
+# aiy-workflow v7
 on:
   workflow_dispatch:
   push:
@@ -137,9 +137,14 @@ const String _androidHook = r'''      - name: Prepare the Android build
 
 const String _flutterBuild = r'''      - name: Build the debug APK
         run: |
+          NAME=$(grep -m1 '^name:' pubspec.yaml | sed 's/^name:[[:space:]]*//' | tr -d '\r"')
           if [ ! -d android ]; then
-            NAME=$(grep -m1 '^name:' pubspec.yaml | sed 's/^name:[[:space:]]*//' | tr -d '\r"')
             flutter create --platforms android --org com.example --project-name "$NAME" .
+          elif [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            # An android/ folder exists but is incomplete (for example only icons): add what is missing, keep what is there.
+            TMPD=$(mktemp -d)
+            flutter create --platforms android --org com.example --project-name "$NAME" "$TMPD/p"
+            cp -rn "$TMPD/p/android/." android/
           fi
           if [ -f .aiy/app_name.txt ]; then
             LABEL=$(head -1 .aiy/app_name.txt | tr -d '\r' | sed 's/[&|\\]/ /g')
@@ -174,7 +179,7 @@ String? workflowFor(ProjectKind k) {
 const String kCheckWorkflowName = 'aiy-check.yml';
 
 const String _checkHead = r"""name: AIy quick check
-# aiy-workflow v6
+# aiy-workflow v7
 on:
   workflow_dispatch:
   push:

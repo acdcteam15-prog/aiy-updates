@@ -1,5 +1,10 @@
 # AIy - changes
 
+## 1.23.1 - incomplete android folder
+- **Fixed: "Flutter failed to read file ... android/app/build.gradle" (build failed, only "exit code 1" shown).** The build workflow only created the Android part when there was no `android/` folder at all. A project with a partial `android/` (for example only icons) skipped that step and Flutter then could not find `build.gradle`. The workflow now tests for `android/app/build.gradle(.kts)` and, when it is missing, generates a fresh Android project and copies in only the missing files (`cp -n`), so existing files are kept. Workflow mark is now **v7**: every repository gets it on its next build.
+- That error is now picked out of the log and treated as a build-setup problem: AI does not try to "fix the code" and spends nothing. Tap "Update and build again".
+- The failing run you sent was Remoty's own workflow (it runs in an `app/` folder of `aiy-updates`). Remoty's code is not in this zip, so apply the same check there.
+
 ## 1.23.0 - free model first
 - **"Try a free model first"** (on by default) in Fix and rebuild automatically, when a paid model is chosen. AIy picks the best free model by itself (a known coding family, then the biggest context, at least 32k). It gets one free try. If it fails, gives no usable fix, its edits do not match your code, its fix changes nothing, or the check still fails, AIy notes why ("Free try with X: ... Switched to Y.") and the paid model takes over for the chosen number of tries.
 - The free try costs nothing. The paid rounds keep the per-request limit from Settings, and the sheet still shows the most they can cost.
