@@ -488,6 +488,15 @@ class _ModeSwitch extends StatelessWidget {
 
   static const double _wide = 92, _narrow = 44;
 
+  /// Where each tab starts: every tab before it adds its width (the selected one is wider).
+  static double _leftOf(int i, int selected) {
+    var x = 0.0;
+    for (var k = 0; k < i; k++) {
+      x += k == selected ? _wide : _narrow;
+    }
+    return x;
+  }
+
   @override
   Widget build(BuildContext context) {
     final s = Theme.of(context).colorScheme;
@@ -509,7 +518,7 @@ class _ModeSwitch extends StatelessWidget {
           AnimatedPositioned(
             duration: dur,
             curve: curve,
-            left: mode * _narrow,
+            left: _leftOf(mode, mode),
             top: 0,
             bottom: 0,
             width: _wide,
