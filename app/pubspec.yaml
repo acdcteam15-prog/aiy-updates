@@ -1,7 +1,7 @@
 name: aiy
 description: AIy - personal AI assistant and coding helper.
 publish_to: 'none'
-version: 1.23.1+1
+version: 1.23.2+2
 
 environment:
   sdk: '>=3.13.0 <4.0.0'
