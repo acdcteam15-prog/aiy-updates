@@ -489,10 +489,10 @@ class _ModeSwitch extends StatelessWidget {
   static const double _wide = 92, _narrow = 44;
 
   /// Where each tab starts: every tab before it adds its width (the selected one is wider).
-  static double _leftOf(int i, int selected) {
+  static double _leftOf(int i, int selected, double wide, double narrow) {
     var x = 0.0;
     for (var k = 0; k < i; k++) {
-      x += k == selected ? _wide : _narrow;
+      x += k == selected ? wide : narrow;
     }
     return x;
   }
@@ -500,6 +500,11 @@ class _ModeSwitch extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = Theme.of(context).colorScheme;
+    // The label grows with the phone's text size: widen the pills with it, so "Code" is never cut off
+    // and the coloured pill never runs into the icon next to the switch.
+    final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
+    final wide = (_wide * scale).clamp(_wide, _wide * 1.6);
+    final narrow = (_narrow * scale).clamp(_narrow, _narrow * 1.4);
     const items = [('Chat', Icons.chat_bubble_outline_rounded), ('Code', Icons.code_rounded), ('Build', Icons.construction_rounded)];
     const dur = Duration(milliseconds: 320);
     const curve = Curves.easeOutCubic;
@@ -512,16 +517,16 @@ class _ModeSwitch extends StatelessWidget {
       ),
       child: SizedBox(
         height: 38,
-        width: _wide + _narrow * (items.length - 1),
+        width: wide + narrow * (items.length - 1),
         child: Stack(children: [
           // One pill slides behind the chosen part.
           AnimatedPositioned(
             duration: dur,
             curve: curve,
-            left: _leftOf(mode, mode),
+            left: _leftOf(mode, mode, wide, narrow),
             top: 0,
             bottom: 0,
-            width: _wide,
+            width: wide,
             child: DecoratedBox(
               decoration: BoxDecoration(
                 gradient: LinearGradient(colors: [s.primary, Color.lerp(s.primary, s.tertiary, 0.45)!]),
@@ -542,7 +547,7 @@ class _ModeSwitch extends StatelessWidget {
                   child: AnimatedContainer(
                     duration: dur,
                     curve: curve,
-                    width: mode == i ? _wide : _narrow,
+                    width: mode == i ? wide : narrow,
                     child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                       AnimatedScale(
                         scale: mode == i ? 1.08 : 1,
